@@ -45,6 +45,7 @@
 #include <Adafruit_INA219.h>
 #include <RTClib.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_freertos_hooks.h>
@@ -69,6 +70,7 @@ static const char* PREF_KEY_USED_MAH = "used_mAh";
 static const char* MQTT_BROKER      = "broker.emqx.io";
 static const uint16_t MQTT_PORT     = 1883;
 static const char* MQTT_TOPIC       = "hardandsoft/esp32/data";
+static const char* MQTT_RAW_TOPIC   = "hardandsoft/esp32/gpio_raw";
 static const char* MQTT_CMD_TOPIC   = "hardandsoft/esp32/cmd";
 static const char* MQTT_STATE_TOPIC = "hardandsoft/esp32/state";
 static const char* MQTT_USER        = "emqx";
@@ -81,6 +83,10 @@ static const uint8_t I2C_SDA  = 8;
 static const uint8_t I2C_SCL  = 9;
 static const uint8_t BTN_NEXT = 3;
 static const uint8_t BTN_PREV = 4;
+
+// GPIO snapshot pins to publish as raw digital states.
+static const uint8_t GPIO_PUBLISH_PINS[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 18, 19, 20, 21};
+static const size_t GPIO_PUBLISH_PIN_COUNT = sizeof(GPIO_PUBLISH_PINS) / sizeof(GPIO_PUBLISH_PINS[0]);
 
 // ================================================================
 // I2C
@@ -137,17 +143,24 @@ static bool hasPCF    = false;
 // ================================================================
 static float    gTemp       = 0.0f;
 static uint8_t  gLightRaw   = 0;
+static uint8_t  gThermRaw   = 0;
+static uint8_t  gExtRaw     = 0;
+static uint8_t  gPotRaw     = 0;
 static float    gLightPct   = 0.0f;
 static int16_t  gRSSI       = 0;
 static float    gVoltage    = 0.0f;
 static float    gCurrentMA  = 0.0f;
 static float    gPowerMW    = 0.0f;
+static uint16_t gInaBusRaw  = 0;
+static int16_t  gInaCurrRaw = 0;
+static uint16_t gInaPowRaw  = 0;
 static float    gTotalMAh   = 0.0f;
 static float    gBattPct    = 100.0f;
 static float    gBattLife   = -1.0f;
 static float    gCpuLoad    = 0.0f;
 static char     gTimestamp[20] = "0000-00-00 00:00:00";
 static uint32_t gUptime     = 0;
+static bool     gBatteryPresent = true;
 
 // ================================================================
 // INTERNAL STATE
@@ -190,10 +203,57 @@ static volatile bool moduleCpuStress = false;
 static void publishState();
 static void drawPage();
 static float measureCpuLoadPct();
+static void buildRawGpioJSON(char* buf, size_t bufSize);
+static void printDegC();
+static bool readNtpTimestamp(char* out, size_t outSize);
 static bool cpuIdleHook();
 static bool getCpuLoadFromRuntimeStats(float& loadOut);
 static float getCpuLoadFromIdleHook();
 static void cpuStressTask(void* parm);
+
+static bool systemTimeValid() {
+  time_t now = time(nullptr);
+  // 2024-01-01 UTC guard to reject unsynced epoch values
+  return now > 1704067200;
+}
+
+static void syncClockFromNtp() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4", "pool.ntp.org", "time.nist.gov");
+
+  uint8_t tries = 0;
+  while (!systemTimeValid() && tries < 25) {
+    delay(200);
+    tries++;
+  }
+
+  if (hasRTC && systemTimeValid()) {
+    struct tm ti;
+    if (getLocalTime(&ti, 100)) {
+      rtc.adjust(DateTime(
+        ti.tm_year + 1900,
+        ti.tm_mon + 1,
+        ti.tm_mday,
+        ti.tm_hour,
+        ti.tm_min,
+        ti.tm_sec
+      ));
+    }
+  }
+}
+
+static bool readNtpTimestamp(char* out, size_t outSize) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;
+
+  struct tm tmNow;
+  localtime_r(&now, &tmNow);
+  snprintf(out, outSize, "%04d-%02d-%02d %02d:%02d:%02d",
+           tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
+           tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
+  return true;
+}
 
 static void loadBatteryState() {
   if (!prefs.begin(PREF_NS, false)) return;
@@ -405,6 +465,20 @@ static bool i2cProbe(uint8_t addr) {
   return (Wire.endTransmission() == 0);
 }
 
+static bool readINA219Register16(uint8_t reg, uint16_t& out) {
+  Wire.beginTransmission(0x40);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  Wire.requestFrom((uint8_t)0x40, (uint8_t)2);
+  if (Wire.available() < 2) return false;
+
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  out = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  return true;
+}
+
 // ================================================================
 // WIFI CONNECT (with TX power fallback)
 // ================================================================
@@ -434,27 +508,55 @@ static bool connectWiFiWithTxPower(wifi_power_t txPower, uint8_t maxTries = 30) 
 // READ ALL SENSORS
 // ================================================================
 static void readSensors() {
-  // --- RTC ---
-  if (hasRTC) {
+  // --- Time source priority: NTP/system -> RTC -> uptime fallback ---
+  if (systemTimeValid()) {
+    struct tm ti;
+    if (getLocalTime(&ti, 50)) {
+      snprintf(gTimestamp, sizeof(gTimestamp), "%04d-%02d-%02d %02d:%02d:%02d",
+               ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+               ti.tm_hour, ti.tm_min, ti.tm_sec);
+    }
+  } else if (hasRTC) {
     DateTime now = rtc.now();
     snprintf(gTimestamp, sizeof(gTimestamp), "%04d-%02d-%02d %02d:%02d:%02d",
              now.year(), now.month(), now.day(),
              now.hour(), now.minute(), now.second());
+  } else {
+    // Fallback timestamp from uptime when RTC is missing.
+    uint32_t s = millis() / 1000;
+    uint32_t hh = (s / 3600) % 24;
+    uint32_t mm = (s / 60) % 60;
+    uint32_t ss = s % 60;
+    snprintf(gTimestamp, sizeof(gTimestamp), "1970-01-01 %02lu:%02lu:%02lu",
+             (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
   }
   gUptime = millis() / 1000;
 
   // --- PCF8591: temperature ---
+  if (hasPCF) {
+    gThermRaw = readPCF8591Stable(CH_THERM);
+    gLightRaw = readPCF8591Stable(CH_LDR);
+    gExtRaw   = readPCF8591Stable(CH_EXT);
+    gPotRaw   = readPCF8591Stable(CH_POT);
+  }
+
   if (hasPCF && moduleTemp) {
     gTemp = readThermistor();
   }
 
   // --- PCF8591: light ---
   if (hasPCF && moduleLight) {
-    gLightRaw = readPCF8591Stable(CH_LDR);
     gLightPct = ((255 - gLightRaw) / 255.0f) * 100.0f;  // lower ADC = more light
   }
 
   // --- INA219 ---
+  if (hasINA219) {
+    uint16_t raw = 0;
+    if (readINA219Register16(0x02, raw)) gInaBusRaw = raw;
+    if (readINA219Register16(0x04, raw)) gInaCurrRaw = (int16_t)raw;
+    if (readINA219Register16(0x03, raw)) gInaPowRaw = raw;
+  }
+
   if (hasINA219 && moduleCurrent) {
     gVoltage   = ina.getBusVoltage_V();
     gCurrentMA = ina.getCurrent_mA();
@@ -476,6 +578,8 @@ static void readSensors() {
   persistBatteryStateIfDue(now_ms);
 
   // --- Battery SOC estimation (hybrid: coulomb + OCV anchor) ---
+  gBatteryPresent = gVoltage > 2.5f;
+
   float socFromCount = 100.0f - (gTotalMAh / BATTERY_CAPACITY) * 100.0f;
   socFromCount = constrain(socFromCount, 0.0f, 100.0f);
 
@@ -507,9 +611,19 @@ static void readSensors() {
   gBattPct = (float)gBattPctShown;
 
   float remaining = BATTERY_CAPACITY * (gSocEstimatePct / 100.0f);
-  gBattLife = (fabsf(gCurrentMA) > 0.1f)
+  gBattLife = (gBatteryPresent && fabsf(gCurrentMA) > 0.1f)
     ? (remaining / fabsf(gCurrentMA)) * 60.0f
     : -1.0f;
+
+  if (!gBatteryPresent) {
+    gCurrentMA = 0.0f;
+    gPowerMW = 0.0f;
+    gSocEstimatePct = 0.0f;
+    gBattPctShown = 0;
+    gBattPct = 0.0f;
+    gBattLife = -1.0f;
+    gTotalMAh = 0.0f;
+  }
 
   // --- WiFi ---
   gRSSI = WiFi.RSSI();
@@ -530,13 +644,47 @@ static void buildJSON(char* buf, size_t bufSize) {
   doc["ldr"]    = gLightRaw;
   doc["ldr_pct"] = roundf(gLightPct * 10.0f) / 10.0f;
   doc["rssi"]   = gRSSI;
-  doc["cpu"]    = roundf(gCpuLoad * 10.0f) / 10.0f;
+  doc["cpu"]    = (int)roundf(gCpuLoad);
   doc["v"]      = roundf(gVoltage * 100.0f) / 100.0f;
   doc["ma"]     = roundf(gCurrentMA * 10.0f) / 10.0f;
-  doc["mw"]     = roundf(gPowerMW * 10.0f) / 10.0f;
-  doc["mah"]    = roundf(gTotalMAh * 100.0f) / 100.0f;
+  doc["mw"]     = (int)roundf(gPowerMW);
+  doc["mah"]    = roundf((gBatteryPresent ? gTotalMAh : 0.0f) * 100.0f) / 100.0f;
   doc["batt"]   = roundf(gBattPct * 10.0f) / 10.0f;
-  doc["batt_min"] = gBattLife > 0 ? (int)gBattLife : -1;
+  doc["batt_min"] = (gBatteryPresent && gBattLife > 0) ? (int)gBattLife : -1;
+  doc["ssid"]   = WiFi.SSID();
+  doc["ip"]     = WiFi.localIP().toString();
+  doc["mac"]    = WiFi.macAddress();
+  doc["channel"] = (int)WiFi.channel();
+
+  serializeJson(doc, buf, bufSize);
+}
+
+// ================================================================
+// BUILD RAW JSON — exact GPIO + raw sensor values
+// ================================================================
+static void buildRawGpioJSON(char* buf, size_t bufSize) {
+  JsonDocument doc;
+  doc["ts"] = gTimestamp;
+  doc["up"] = gUptime;
+
+  JsonObject gpio = doc["gpio"].to<JsonObject>();
+  for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
+    const uint8_t pin = GPIO_PUBLISH_PINS[i];
+    char key[10];
+    snprintf(key, sizeof(key), "gpio%u", pin);
+    gpio[key] = digitalRead(pin);
+  }
+
+  JsonObject pcfRaw = doc["pcf8591_raw"].to<JsonObject>();
+  pcfRaw["ch0_ldr"] = gLightRaw;
+  pcfRaw["ch1_therm"] = gThermRaw;
+  pcfRaw["ch2_ext"] = gExtRaw;
+  pcfRaw["ch3_pot"] = gPotRaw;
+
+  JsonObject inaRaw = doc["ina219_raw"].to<JsonObject>();
+  inaRaw["bus"] = gInaBusRaw;
+  inaRaw["current"] = gInaCurrRaw;
+  inaRaw["power"] = gInaPowRaw;
 
   serializeJson(doc, buf, bufSize);
 }
@@ -660,6 +808,11 @@ static void drawCentered(const char* text, int y, int sz) {
   oled.print(text);
 }
 
+static void printDegC() {
+  oled.write(248);  // Degree symbol in cp437 for Adafruit GFX default font
+  oled.print("C");
+}
+
 // ================================================================
 // OLED PAGES
 // ================================================================
@@ -669,23 +822,22 @@ static void pageDashboard() {
   oled.setTextSize(1);
   oled.setCursor(4, 2);
   oled.print("MONITOR");
-  if (strlen(gTimestamp) >= 16) {
-    oled.setCursor(80, 2);
-    // Print HH:MM from timestamp
-    char hhmm[6];
-    memcpy(hhmm, gTimestamp + 11, 5);
-    hhmm[5] = '\0';
-    oled.print(hhmm);
+  if (strlen(gTimestamp) >= 19) {
+    oled.setCursor(76, 2);
+    char hhmmss[9];
+    memcpy(hhmmss, gTimestamp + 11, 8);
+    hhmmss[8] = '\0';
+    oled.print(hhmmss);
   }
   oled.setTextColor(SSD1306_WHITE);
 
   oled.setTextSize(1);
-  oled.setCursor(0, 15);  oled.printf("T:%.1fC", gTemp);
+  oled.setCursor(0, 15);  oled.printf("T:%.1f", gTemp); printDegC();
   oled.setCursor(68, 15); oled.printf("L:%.0f%%", gLightPct);
-  oled.setCursor(0, 25);  oled.printf("%.2fV", gVoltage);
-  oled.setCursor(68, 25); oled.printf("%.0fmA", gCurrentMA);
-  oled.setCursor(0, 35);  oled.printf("%ddBm", gRSSI);
-  oled.setCursor(68, 35); oled.printf("CPU:%.1f%%", gCpuLoad);
+  oled.setCursor(0, 25);  oled.printf("P:%.0fmW", gPowerMW);
+  oled.setCursor(68, 25); oled.printf("C:%.0fmA", gCurrentMA);
+  oled.setCursor(0, 35);  oled.printf("R:%ddBm", gRSSI);
+  oled.setCursor(68, 35); oled.printf("CPU:%d%%", (int)roundf(gCpuLoad));
 
   drawProgressBar(0, 47, 104, 10, gBattPct);
   oled.setCursor(108, 49);
@@ -693,20 +845,23 @@ static void pageDashboard() {
 }
 
 static void pageTemp() {
-  drawTitleBar("TEMPERATURE");
+  drawTitleBar("TEMPERATURA");
   char buf[10];
   snprintf(buf, sizeof(buf), "%.1f", gTemp);
   int numW = strlen(buf) * 18;
   int sx = (128 - numW - 14) / 2;
   if (sx < 0) sx = 0;
   oled.setTextSize(3); oled.setCursor(sx, 18); oled.print(buf);
-  oled.setTextSize(2); oled.setCursor(sx + numW + 2, 22); oled.print("C");
+  int cx = sx + numW + 6;
+  int cy = 22;
+  oled.setTextSize(2); oled.setCursor(cx, cy); oled.print("C");
+  oled.drawCircle(cx - 4, cy + 1, 1, SSD1306_WHITE);
   float pct = constrain((gTemp + 10.0f) / 60.0f * 100.0f, 0, 100);
   drawProgressBar(4, 48, 120, 8, pct);
 }
 
 static void pageLight() {
-  drawTitleBar("LIGHT");
+  drawTitleBar("LUMINA");
   char buf[10];
   snprintf(buf, sizeof(buf), "%.0f", gLightPct);
   int numW = strlen(buf) * 18;
@@ -716,23 +871,27 @@ static void pageLight() {
   oled.setTextSize(2); oled.setCursor(sx + numW + 2, 20); oled.print("%");
   oled.setTextSize(1);
   char raw[16];
-  snprintf(raw, sizeof(raw), "Raw: %d / 255", gLightRaw);
+  snprintf(raw, sizeof(raw), "Brut: %d / 255", gLightRaw);
   drawCentered(raw, 42, 1);
   drawProgressBar(4, 52, 120, 8, gLightPct);
 }
 
 static void pageWiFi() {
-  drawTitleBar("WIFI + MQTT");
+  drawTitleBar("RETEA + MQTT");
   oled.setTextSize(1);
   oled.setCursor(0, 15); oled.printf("SSID: %s", WiFi.SSID().c_str());
   oled.setCursor(0, 25); oled.printf("IP:   %s", WiFi.localIP().toString().c_str());
   oled.setCursor(0, 35); oled.printf("RSSI: %d dBm", gRSSI);
-  oled.setCursor(0, 45); oled.printf("MQTT: %s", mqtt.connected() ? "OK" : "Off");
+  oled.setCursor(0, 45); oled.printf("Data: %.10s", strlen(gTimestamp) >= 10 ? gTimestamp : "----------");
+  oled.setCursor(0, 55); oled.printf("MQTT:%s", mqtt.connected() ? "OK" : "Off");
 
-  int bars = gRSSI > -50 ? 4 : gRSSI > -60 ? 3 : gRSSI > -70 ? 2 : gRSSI > -80 ? 1 : 0;
+  int bars = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    bars = constrain((gRSSI + 100) / 10, 0, 4);
+  }
   for (int i = 0; i < 4; i++) {
     int bh = 4 + i * 3;
-    int by = 44 - bh;
+    int by = 54 - bh;
     int bx = 100 + i * 7;
     if (i < bars) oled.fillRect(bx, by, 5, bh, SSD1306_WHITE);
     else          oled.drawRect(bx, by, 5, bh, SSD1306_WHITE);
@@ -740,9 +899,9 @@ static void pageWiFi() {
 }
 
 static void pageCPU() {
-  drawTitleBar("CPU LOAD");
+  drawTitleBar("INC. CPU");
   char buf[10];
-  snprintf(buf, sizeof(buf), "%.1f", gCpuLoad);
+  snprintf(buf, sizeof(buf), "%d", (int)roundf(gCpuLoad));
   int numW = strlen(buf) * 18;
   int sx = (128 - numW - 14) / 2;
   if (sx < 0) sx = 0;
@@ -752,7 +911,7 @@ static void pageCPU() {
 }
 
 static void pageVoltage() {
-  drawTitleBar("VOLTAGE");
+  drawTitleBar("TENSIUNE");
   char buf[10];
   snprintf(buf, sizeof(buf), "%.2f", gVoltage);
   int numW = strlen(buf) * 18;
@@ -761,27 +920,27 @@ static void pageVoltage() {
   oled.setTextSize(3); oled.setCursor(sx, 16); oled.print(buf);
   oled.setTextSize(2); oled.setCursor(sx + numW + 2, 20); oled.print("V");
   char pow[20];
-  snprintf(pow, sizeof(pow), "Power: %.1f mW", gPowerMW);
+  snprintf(pow, sizeof(pow), "Put: %.0f mW", gPowerMW);
   drawCentered(pow, 42, 1);
   float pct = constrain((gVoltage - 3.0f) / 1.2f * 100.0f, 0, 100);
   drawProgressBar(4, 52, 120, 8, pct);
 }
 
 static void pageCurrent() {
-  drawTitleBar("CURRENT");
+  drawTitleBar("CURENT");
   char buf[16];
   snprintf(buf, sizeof(buf), "%.0f mA", gCurrentMA);
   drawCentered(buf, 18, 2);
   char total[22];
-  snprintf(total, sizeof(total), "Total: %.2f mAh", gTotalMAh);
+  snprintf(total, sizeof(total), "CP: %.2f mAh", gBatteryPresent ? gTotalMAh : 0.0f);
   drawCentered(total, 38, 1);
   char pow[20];
-  snprintf(pow, sizeof(pow), "Power: %.1f mW", gPowerMW);
+  snprintf(pow, sizeof(pow), "Put: %.0f mW", gPowerMW);
   drawCentered(pow, 48, 1);
 }
 
 static void pageBattery() {
-  drawTitleBar("BATTERY");
+  drawTitleBar("BATERIE");
   char buf[10];
   snprintf(buf, sizeof(buf), "%.0f", gBattPct);
   int numW = strlen(buf) * 18;
@@ -790,17 +949,19 @@ static void pageBattery() {
   oled.setTextSize(3); oled.setCursor(sx, 16); oled.print(buf);
   oled.setTextSize(2); oled.setCursor(sx + numW + 2, 20); oled.print("%");
   oled.setTextSize(1);
-  if (gBattLife > 0) {
+  if (gBatteryPresent && gBattLife > 0) {
     int hrs = (int)gBattLife / 60;
     int mins = (int)gBattLife % 60;
     char est[20];
-    snprintf(est, sizeof(est), "Est: %dh %dm left", hrs, mins);
+    snprintf(est, sizeof(est), "Est: %dh %dm", hrs, mins);
     drawCentered(est, 40, 1);
+  } else if (!gBatteryPresent) {
+    drawCentered("Est: -- (fara bat)", 40, 1);
   } else {
-    drawCentered("Est: -- (no load)", 40, 1);
+    drawCentered("Est: -- (fara sarc)", 40, 1);
   }
   char used[24];
-  snprintf(used, sizeof(used), "%.1f / %.0f mAh", gTotalMAh, BATTERY_CAPACITY);
+  snprintf(used, sizeof(used), "CP: %.2f mAh", gBatteryPresent ? gTotalMAh : 0.0f);
   drawCentered(used, 50, 1);
 }
 
@@ -958,6 +1119,7 @@ void setup() {
   }
 
   if (wifiOk) {
+    syncClockFromNtp();
     Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
     if (hasOLED) {
       oled.clearDisplay();
@@ -975,7 +1137,7 @@ void setup() {
   mqttClientId = "esp32-hs-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
-  mqtt.setBufferSize(512);
+  mqtt.setBufferSize(1024);
   connectMqtt();
 
   loadBatteryState();
@@ -1017,6 +1179,10 @@ void loop() {
       char json[384];
       buildJSON(json, sizeof(json));
       mqtt.publish(MQTT_TOPIC, json);
+
+      char rawJson[768];
+      buildRawGpioJSON(rawJson, sizeof(rawJson));
+      mqtt.publish(MQTT_RAW_TOPIC, rawJson);
     }
 
     drawPage();
