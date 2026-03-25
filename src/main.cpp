@@ -36,6 +36,7 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>
+#include <stdarg.h>
 
 #include <Wire.h>
 #include <WiFi.h>
@@ -54,12 +55,13 @@
 // ================================================================
 // CONFIGURATION
 // ================================================================
-static const char* WIFI_SSID = "DIGI-75hC";
-static const char* WIFI_PASS = "9T2Du96euz";
+static const char* WIFI_SSID = "DIGI";
+static const char* WIFI_PASS = "27mc2004ca";
 
 static const float BATTERY_CAPACITY = 3200.0f;  // mAh
 static const float BATT_REST_CURRENT_MA = 80.0f;  // ~C/40 for 3200mAh cell
 static const uint32_t BATT_REST_TIME_MS = 30000;
+static const float BATT_OCV_MISMATCH_RECOVER_PCT = 20.0f;
 static const uint32_t BATT_SAVE_INTERVAL_MS = 60000;
 static const char* PREF_NS = "battery";
 static const char* PREF_KEY_USED_MAH = "used_mAh";
@@ -117,7 +119,7 @@ static const float B_COEFF   = 3950.0f;
 // ================================================================
 static const uint8_t  SCREEN_W      = 128;
 static const uint8_t  SCREEN_H      = 64;
-static const uint8_t  NUM_PAGES     = 8;
+static const uint8_t  NUM_PAGES     = 9;
 static const uint16_t DEBOUNCE_MS   = 200;
 
 // ================================================================
@@ -181,6 +183,19 @@ static float gSocEstimatePct = 100.0f;
 static int gBattPctShown = 100;
 static uint32_t gRestAccumMs = 0;
 static uint32_t gLastBattPersistMs = 0;
+static bool gHasPersistedBatteryState = false;
+static bool gBootstrapFromVoltageDone = false;
+
+// OLED page 9 compact live logs (same sources as MQTT raw payload)
+static const uint8_t OLED_LOG_LINES = 5;
+static const uint8_t OLED_LOG_LINE_LEN = 21;  // 21 chars fit in 128px at text size 1
+static char gOledLog[OLED_LOG_LINES][OLED_LOG_LINE_LEN + 1];
+static uint8_t gOledLogHead = 0;
+static bool gOledLogHasData = false;
+static int8_t gGpioLastState[GPIO_PUBLISH_PIN_COUNT];
+static bool gGpioLogPrimed = false;
+static uint32_t gGpioLogSeq = 0;
+static uint8_t gRawSnapshotPhase = 0;
 
 // Sensor read interval tracking
 static uint32_t lastSensorRead = 0;
@@ -210,6 +225,9 @@ static bool cpuIdleHook();
 static bool getCpuLoadFromRuntimeStats(float& loadOut);
 static float getCpuLoadFromIdleHook();
 static void cpuStressTask(void* parm);
+static void appendOledLog(const char* fmt, ...);
+static void updateOledRawLog();
+static const char* gpioShortName(uint8_t pin);
 
 static bool systemTimeValid() {
   time_t now = time(nullptr);
@@ -257,9 +275,17 @@ static bool readNtpTimestamp(char* out, size_t outSize) {
 
 static void loadBatteryState() {
   if (!prefs.begin(PREF_NS, false)) return;
-  gTotalMAh = prefs.getFloat(PREF_KEY_USED_MAH, gTotalMAh);
+  gHasPersistedBatteryState = prefs.isKey(PREF_KEY_USED_MAH);
+  if (gHasPersistedBatteryState) {
+    gTotalMAh = prefs.getFloat(PREF_KEY_USED_MAH, gTotalMAh);
+  }
   prefs.end();
   gTotalMAh = constrain(gTotalMAh, 0.0f, BATTERY_CAPACITY);
+
+  // If no persisted value exists, SOC will be bootstrapped from measured voltage.
+  if (!gHasPersistedBatteryState) {
+    gBootstrapFromVoltageDone = false;
+  }
 }
 
 static void persistBatteryStateIfDue(uint32_t nowMs) {
@@ -269,6 +295,74 @@ static void persistBatteryStateIfDue(uint32_t nowMs) {
   if (!prefs.begin(PREF_NS, false)) return;
   prefs.putFloat(PREF_KEY_USED_MAH, gTotalMAh);
   prefs.end();
+}
+
+static void appendOledLog(const char* fmt, ...) {
+  char line[OLED_LOG_LINE_LEN + 1];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+
+  line[OLED_LOG_LINE_LEN] = '\0';
+  strncpy(gOledLog[gOledLogHead], line, OLED_LOG_LINE_LEN);
+  gOledLog[gOledLogHead][OLED_LOG_LINE_LEN] = '\0';
+
+  gOledLogHead = (gOledLogHead + 1) % OLED_LOG_LINES;
+  gOledLogHasData = true;
+}
+
+static const char* gpioShortName(uint8_t pin) {
+  switch (pin) {
+    case 3: return "BTN+";
+    case 4: return "BTN-";
+    case 8: return "SDA";
+    case 9: return "SCL";
+    default: return "IO";
+  }
+}
+
+static void updateOledRawLog() {
+  gGpioLogSeq++;
+
+  // First sample seeds baseline to avoid startup noise in the change feed.
+  if (!gGpioLogPrimed) {
+    for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
+      gGpioLastState[i] = digitalRead(GPIO_PUBLISH_PINS[i]);
+    }
+    appendOledLog("Logger pornit");
+    gGpioLogPrimed = true;
+    return;
+  }
+
+  int changes = 0;
+  for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
+    const uint8_t pin = GPIO_PUBLISH_PINS[i];
+    int8_t nowState = digitalRead(pin);
+    if (nowState != gGpioLastState[i]) {
+      appendOledLog("#%lu G%02u %s %s", (unsigned long)(gGpioLogSeq % 1000), pin,
+                    gpioShortName(pin), nowState ? "ON" : "OFF");
+      gGpioLastState[i] = nowState;
+      changes++;
+      if (changes >= 2) break;  // keep feed readable on a tiny screen
+    }
+  }
+
+  if (changes > 0) return;
+
+  // No GPIO edge this second: rotate compact raw snapshots (same sources as MQTT raw).
+  switch (gRawSnapshotPhase % 3) {
+    case 0:
+      appendOledLog("PCF LDR:%03u TH:%03u", gLightRaw, gThermRaw);
+      break;
+    case 1:
+      appendOledLog("PCF EXT:%03u POT:%03u", gExtRaw, gPotRaw);
+      break;
+    default:
+      appendOledLog("INA BUS:%05u CUR:%d", gInaBusRaw, gInaCurrRaw);
+      break;
+  }
+  gRawSnapshotPhase++;
 }
 
 static float ocvToSocPct(float v) {
@@ -532,25 +626,25 @@ static void readSensors() {
   }
   gUptime = millis() / 1000;
 
-  // --- PCF8591: temperature ---
-  if (hasPCF) {
-    gThermRaw = readPCF8591Stable(CH_THERM);
-    gLightRaw = readPCF8591Stable(CH_LDR);
-    gExtRaw   = readPCF8591Stable(CH_EXT);
-    gPotRaw   = readPCF8591Stable(CH_POT);
-  }
-
+  // --- PCF8591: read only enabled channels ---
   if (hasPCF && moduleTemp) {
+    gThermRaw = readPCF8591Stable(CH_THERM);
     gTemp = readThermistor();
   }
 
-  // --- PCF8591: light ---
   if (hasPCF && moduleLight) {
+    gLightRaw = readPCF8591Stable(CH_LDR);
     gLightPct = ((255 - gLightRaw) / 255.0f) * 100.0f;  // lower ADC = more light
   }
 
+  // Keep raw debug channels live only when at least one PCF module is enabled.
+  if (hasPCF && (moduleTemp || moduleLight)) {
+    gExtRaw = readPCF8591Stable(CH_EXT);
+    gPotRaw = readPCF8591Stable(CH_POT);
+  }
+
   // --- INA219 ---
-  if (hasINA219) {
+  if (hasINA219 && moduleCurrent) {
     uint16_t raw = 0;
     if (readINA219Register16(0x02, raw)) gInaBusRaw = raw;
     if (readINA219Register16(0x04, raw)) gInaCurrRaw = (int16_t)raw;
@@ -566,19 +660,38 @@ static void readSensors() {
     if (isnan(gVoltage)   || isinf(gVoltage))   gVoltage   = 0.0f;
     if (isnan(gCurrentMA) || isinf(gCurrentMA))  gCurrentMA = 0.0f;
     if (isnan(gPowerMW)   || isinf(gPowerMW))    gPowerMW   = 0.0f;
+  } else if (!moduleCurrent) {
+    // Module OFF: stop current/power processing and battery integration.
+    gCurrentMA = 0.0f;
+    gPowerMW = 0.0f;
+    gBattLife = -1.0f;
+    gBatteryPresent = false;
+  }
+
+  // If Preferences was reset/missing, seed SOC from OCV instead of defaulting to 100%.
+  if (!gHasPersistedBatteryState && !gBootstrapFromVoltageDone && gVoltage > 2.5f) {
+    float socFromOcv = ocvToSocPct(gVoltage);
+    gSocEstimatePct = constrain(socFromOcv, 0.0f, 100.0f);
+    gTotalMAh = BATTERY_CAPACITY * (1.0f - gSocEstimatePct / 100.0f);
+    gBattPctShown = (int)roundf(gSocEstimatePct);
+    gBootstrapFromVoltageDone = true;
   }
 
   // --- Energy accumulation (coulomb counting) ---
   uint32_t now_ms = millis();
   uint32_t dt_ms = now_ms - lastEnergy;
-  float dt_hours = dt_ms / 3600000.0f;
-  float deltaMAh = gCurrentMA * dt_hours;  // positive = discharge, negative = charging
-  gTotalMAh = constrain(gTotalMAh + deltaMAh, 0.0f, BATTERY_CAPACITY);
+  if (moduleCurrent) {
+    float dt_hours = dt_ms / 3600000.0f;
+    float deltaMAh = gCurrentMA * dt_hours;  // positive = discharge, negative = charging
+    gTotalMAh = constrain(gTotalMAh + deltaMAh, 0.0f, BATTERY_CAPACITY);
+    persistBatteryStateIfDue(now_ms);
+  }
   lastEnergy = now_ms;
-  persistBatteryStateIfDue(now_ms);
 
-  // --- Battery SOC estimation (hybrid: coulomb + OCV anchor) ---
-  gBatteryPresent = gVoltage > 2.5f;
+  // --- Battery SOC estimation (hybrid: coulomb + adaptive OCV correction) ---
+  if (moduleCurrent) {
+    gBatteryPresent = gVoltage > 2.5f;
+  }
 
   float socFromCount = 100.0f - (gTotalMAh / BATTERY_CAPACITY) * 100.0f;
   socFromCount = constrain(socFromCount, 0.0f, 100.0f);
@@ -587,22 +700,37 @@ static void readSensors() {
   if (nearRest) gRestAccumMs += dt_ms;
   else          gRestAccumMs = 0;
 
-  if (nearRest && gRestAccumMs >= BATT_REST_TIME_MS && gVoltage > 2.5f) {
-    // At near-rest, voltage is more trustworthy: slowly pull SOC to OCV estimate.
+  if (moduleCurrent && gBatteryPresent) {
     float socFromOcv = ocvToSocPct(gVoltage);
-    gSocEstimatePct = 0.75f * socFromCount + 0.25f * socFromOcv;
+    float mismatchPct = fabsf(socFromCount - socFromOcv);
+    bool longRest = nearRest && gRestAccumMs >= BATT_REST_TIME_MS;
+
+    // Base OCV trust by operating mode.
+    float ocvWeight = 0.15f;  // under load: small correction only
+    if (nearRest) ocvWeight = 0.35f;
+    if (longRest) ocvWeight = 0.55f;
+
+    // Recover quickly if persisted/current counter state disagrees strongly with voltage.
+    if (mismatchPct >= BATT_OCV_MISMATCH_RECOVER_PCT) {
+      ocvWeight = max(ocvWeight, longRest ? 0.75f : 0.50f);
+    }
+
+    gSocEstimatePct = (1.0f - ocvWeight) * socFromCount + ocvWeight * socFromOcv;
+
+    // Keep coulomb counter aligned with corrected SOC to avoid snapping back.
     gTotalMAh = BATTERY_CAPACITY * (1.0f - gSocEstimatePct / 100.0f);
-  } else {
-    gSocEstimatePct = socFromCount;
+    gTotalMAh = constrain(gTotalMAh, 0.0f, BATTERY_CAPACITY);
+  } else if (moduleCurrent) {
+    gSocEstimatePct = 0.0f;
   }
 
   gSocEstimatePct = constrain(gSocEstimatePct, 0.0f, 100.0f);
 
   // 1% stepped display behavior with anti-jitter.
   int targetPct = (int)roundf(gSocEstimatePct);
-  if (gCurrentMA >= 5.0f) {
+  if (moduleCurrent && gCurrentMA >= 5.0f) {
     if (targetPct < gBattPctShown) gBattPctShown = targetPct;
-  } else if (gCurrentMA <= -20.0f) {
+  } else if (moduleCurrent && gCurrentMA <= -20.0f) {
     if (targetPct > gBattPctShown) gBattPctShown = targetPct;
   } else {
     gBattPctShown = targetPct;
@@ -611,11 +739,11 @@ static void readSensors() {
   gBattPct = (float)gBattPctShown;
 
   float remaining = BATTERY_CAPACITY * (gSocEstimatePct / 100.0f);
-  gBattLife = (gBatteryPresent && fabsf(gCurrentMA) > 0.1f)
+  gBattLife = (moduleCurrent && gBatteryPresent && fabsf(gCurrentMA) > 0.1f)
     ? (remaining / fabsf(gCurrentMA)) * 60.0f
     : -1.0f;
 
-  if (!gBatteryPresent) {
+  if (moduleCurrent && !gBatteryPresent) {
     gCurrentMA = 0.0f;
     gPowerMW = 0.0f;
     gSocEstimatePct = 0.0f;
@@ -630,6 +758,9 @@ static void readSensors() {
 
   // --- CPU load ---
   gCpuLoad = measureCpuLoadPct();
+
+  // --- OLED log feed uses same raw sources as MQTT raw payload ---
+  updateOledRawLog();
 }
 
 // ================================================================
@@ -640,17 +771,34 @@ static void buildJSON(char* buf, size_t bufSize) {
 
   doc["ts"]   = gTimestamp;
   doc["up"]   = gUptime;
-  doc["temp"]   = roundf(gTemp * 10.0f) / 10.0f;
-  doc["ldr"]    = gLightRaw;
-  doc["ldr_pct"] = roundf(gLightPct * 10.0f) / 10.0f;
+  if (moduleTemp) doc["temp"] = roundf(gTemp * 10.0f) / 10.0f;
+  else            doc["temp"] = nullptr;
+
+  if (moduleLight) doc["ldr"] = gLightRaw;
+  else             doc["ldr"] = nullptr;
+
+  if (moduleLight) doc["ldr_pct"] = roundf(gLightPct * 10.0f) / 10.0f;
+  else             doc["ldr_pct"] = nullptr;
+
   doc["rssi"]   = gRSSI;
   doc["cpu"]    = (int)roundf(gCpuLoad);
-  doc["v"]      = roundf(gVoltage * 100.0f) / 100.0f;
-  doc["ma"]     = roundf(gCurrentMA * 10.0f) / 10.0f;
-  doc["mw"]     = (int)roundf(gPowerMW);
-  doc["mah"]    = roundf((gBatteryPresent ? gTotalMAh : 0.0f) * 100.0f) / 100.0f;
-  doc["batt"]   = roundf(gBattPct * 10.0f) / 10.0f;
-  doc["batt_min"] = (gBatteryPresent && gBattLife > 0) ? (int)gBattLife : -1;
+
+  if (moduleCurrent) doc["v"] = roundf(gVoltage * 100.0f) / 100.0f;
+  else               doc["v"] = nullptr;
+
+  if (moduleCurrent) doc["ma"] = roundf(gCurrentMA * 10.0f) / 10.0f;
+  else               doc["ma"] = nullptr;
+
+  if (moduleCurrent) doc["mw"] = (int)roundf(gPowerMW);
+  else               doc["mw"] = nullptr;
+
+  if (moduleCurrent) doc["mah"] = roundf((gBatteryPresent ? gTotalMAh : 0.0f) * 100.0f) / 100.0f;
+  else               doc["mah"] = nullptr;
+
+  if (moduleCurrent) doc["batt"] = roundf(gBattPct * 10.0f) / 10.0f;
+  else               doc["batt"] = nullptr;
+
+  doc["batt_min"] = (moduleCurrent && gBatteryPresent && gBattLife > 0) ? (int)gBattLife : -1;
   doc["ssid"]   = WiFi.SSID();
   doc["ip"]     = WiFi.localIP().toString();
   doc["mac"]    = WiFi.macAddress();
@@ -676,15 +824,22 @@ static void buildRawGpioJSON(char* buf, size_t bufSize) {
   }
 
   JsonObject pcfRaw = doc["pcf8591_raw"].to<JsonObject>();
-  pcfRaw["ch0_ldr"] = gLightRaw;
-  pcfRaw["ch1_therm"] = gThermRaw;
-  pcfRaw["ch2_ext"] = gExtRaw;
-  pcfRaw["ch3_pot"] = gPotRaw;
+  if (moduleLight)             pcfRaw["ch0_ldr"] = gLightRaw;
+  else                         pcfRaw["ch0_ldr"] = nullptr;
+  if (moduleTemp)              pcfRaw["ch1_therm"] = gThermRaw;
+  else                         pcfRaw["ch1_therm"] = nullptr;
+  if (moduleTemp || moduleLight) pcfRaw["ch2_ext"] = gExtRaw;
+  else                           pcfRaw["ch2_ext"] = nullptr;
+  if (moduleTemp || moduleLight) pcfRaw["ch3_pot"] = gPotRaw;
+  else                           pcfRaw["ch3_pot"] = nullptr;
 
   JsonObject inaRaw = doc["ina219_raw"].to<JsonObject>();
-  inaRaw["bus"] = gInaBusRaw;
-  inaRaw["current"] = gInaCurrRaw;
-  inaRaw["power"] = gInaPowRaw;
+  if (moduleCurrent) inaRaw["bus"] = gInaBusRaw;
+  else               inaRaw["bus"] = nullptr;
+  if (moduleCurrent) inaRaw["current"] = gInaCurrRaw;
+  else               inaRaw["current"] = nullptr;
+  if (moduleCurrent) inaRaw["power"] = gInaPowRaw;
+  else               inaRaw["power"] = nullptr;
 
   serializeJson(doc, buf, bufSize);
 }
@@ -965,6 +1120,43 @@ static void pageBattery() {
   drawCentered(used, 50, 1);
 }
 
+static void pageRawLog() {
+  bool summaryView = ((millis() / 5000UL) % 2UL) == 1UL;
+
+  if (summaryView) drawTitleBar("RAW SUMMARY");
+  else             drawTitleBar("RAW EVENTS");
+
+  oled.setTextSize(1);
+
+  if (summaryView) {
+    int gpioHigh = 0;
+    for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
+      int state = digitalRead(GPIO_PUBLISH_PINS[i]);
+      if (state) gpioHigh++;
+    }
+
+    oled.setCursor(0, 14); oled.printf("LDR:%3u THM:%3u", gLightRaw, gThermRaw);
+    oled.setCursor(0, 24); oled.printf("EXT:%3u POT:%3u", gExtRaw, gPotRaw);
+    oled.setCursor(0, 34); oled.printf("BUS:%5u", gInaBusRaw);
+    oled.setCursor(0, 44); oled.printf("CUR:%5d P:%5u", gInaCurrRaw, gInaPowRaw);
+    oled.setCursor(0, 54); oled.printf("GPIO HIGH:%2d/%2d", gpioHigh, (int)GPIO_PUBLISH_PIN_COUNT);
+    return;
+  }
+
+  if (!gOledLogHasData) {
+    drawCentered("Astept evenimente...", 28, 1);
+    return;
+  }
+
+  for (uint8_t row = 0; row < OLED_LOG_LINES; row++) {
+    uint8_t idx = (gOledLogHead + row) % OLED_LOG_LINES;
+    oled.setCursor(0, 14 + row * 10);
+    if (row == OLED_LOG_LINES - 1) oled.print('>');
+    else oled.print(' ');
+    oled.print(gOledLog[idx]);
+  }
+}
+
 // ================================================================
 // OLED PAGE ROUTER
 // ================================================================
@@ -981,6 +1173,7 @@ static void drawPage() {
     case 5: pageVoltage();   break;
     case 6: pageCurrent();   break;
     case 7: pageBattery();   break;
+    case 8: pageRawLog();    break;
   }
   oled.setTextSize(1);
   oled.setCursor(100, 57);
@@ -1141,6 +1334,10 @@ void setup() {
   connectMqtt();
 
   loadBatteryState();
+
+  for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
+    gGpioLastState[i] = -1;
+  }
 
   lastSensorRead = millis();
   lastEnergy = millis();
