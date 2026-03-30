@@ -9,7 +9,7 @@
  *   - SSD1306 0.96" OLED 128x64   (I2C 0x3C)
  *   - INA219 current/power monitor (I2C 0x40)
  *   - DS1307 RTC module HW-111    (I2C 0x68)
- *   - 10k NTC thermistor divider on GPIO0 (ADC)
+ *   - 10k NTC thermistor divider on A0 (ADC)
  *   - LSM6DS3-compatible gyro      (I2C 0x6A)
  *   - LG INR18650MH1 battery      (3.6V nom, 3200mAh)
  *   - 2x tactile push buttons
@@ -19,13 +19,13 @@
  *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3
  *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3
  *   Thermistor divider:
- *     3.3V -> 10k resistor -> GPIO0 -> 10k NTC -> GND
+ *     3.3V -> 10k resistor -> A0 -> 10k NTC -> GND
  *   Buttons (active LOW, internal pull-up):
  *     ESP32 GPIO3 --> Button NEXT --> GND
  *     ESP32 GPIO4 --> Button PREV --> GND
  *
  * FIXES vs original:
- *   - Migrated thermistor to direct ADC read on GPIO0
+ *   - Migrated thermistor to direct ADC read on A0
  *   - Added LSM6DS3 gyroscope readout over I2C
  *   - I2C clock set to 100kHz for DS1307 compatibility
  *   - INA219: explicit 16V/400mA calibration for battery monitoring
@@ -95,19 +95,19 @@ static const uint8_t BTN_PREV = 4;
 
 // GPIO snapshot pins to publish as raw digital states.
 // GPIO18/19 are native USB D-/D+ on ESP32-C3; avoid probing them as GPIO.
-static const uint8_t GPIO_PUBLISH_PINS[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21};
+static const uint8_t GPIO_PUBLISH_PINS[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21};
 static const size_t GPIO_PUBLISH_PIN_COUNT = sizeof(GPIO_PUBLISH_PINS) / sizeof(GPIO_PUBLISH_PINS[0]);
 
 // ================================================================
 // I2C + ANALOG
 // ================================================================
 static const uint32_t I2C_FREQ      = 100000;  // 100kHz — safe for DS1307
-static const uint8_t THERM_PIN      = 0;       // GPIO0: divider midpoint
+static const uint8_t THERM_PIN      = A0;      // A0: thermistor divider midpoint
 static const float ADC_MAX          = 4095.0f; // ESP32-C3 12-bit ADC
 
 // ================================================================
 // NTC THERMISTOR (10k divider)
-// Circuit: 3.3V -> 10k fixed -> ADC(GPIO0) -> 10k NTC -> GND
+// Circuit: 3.3V -> 10k fixed -> ADC(A0) -> 10k NTC -> GND
 // ================================================================
 static const float R_FIXED   = 10000.0f;
 static const float R_NOMINAL = 10000.0f;
@@ -497,7 +497,7 @@ static float readThermistor() {
   }
 
   gThermRaw = (uint16_t)(sum / samples);
-  if (gThermRaw <= 1 || gThermRaw >= (uint16_t)(ADC_MAX - 1.0f)) return -99.0f;
+  if (gThermRaw <= 1 || gThermRaw >= (uint16_t)(ADC_MAX - 1.0f)) return NAN;
 
   float adc = (float)gThermRaw;
   float rNtc = R_FIXED * adc / (ADC_MAX - adc);
@@ -509,7 +509,7 @@ static float readThermistor() {
   steinhart = 1.0f / steinhart;
   steinhart -= 273.15f;
 
-  if (steinhart < -40.0f || steinhart > 125.0f) return -99.0f;
+  if (steinhart < -40.0f || steinhart > 125.0f) return NAN;
 
   return steinhart;
 }
@@ -619,6 +619,8 @@ static void readSensors() {
 
   if (moduleTemp) {
     gTemp = readThermistor();
+  } else {
+    gTemp = NAN;
   }
 
   if (hasGyro && moduleGyro) {
@@ -756,8 +758,8 @@ static void buildJSON(char* buf, size_t bufSize) {
 
   doc["ts"]   = gTimestamp;
   doc["up"]   = gUptime;
-  if (moduleTemp) doc["temp"] = roundf(gTemp * 10.0f) / 10.0f;
-  else            doc["temp"] = nullptr;
+  if (moduleTemp && isfinite(gTemp)) doc["temp"] = roundf(gTemp * 10.0f) / 10.0f;
+  else                               doc["temp"] = nullptr;
   doc["temp_raw"] = moduleTemp ? gThermRaw : 0;
 
   if (moduleGyro && hasGyro) {
@@ -985,7 +987,13 @@ static void pageDashboard() {
   oled.setTextColor(SSD1306_WHITE);
 
   oled.setTextSize(1);
-  oled.setCursor(0, 15);  oled.printf("T:%.1f", gTemp); printDegC();
+  oled.setCursor(0, 15);
+  if (moduleTemp && isfinite(gTemp)) {
+    oled.printf("T:%.1f", gTemp);
+    printDegC();
+  } else {
+    oled.print("T:--.-C");
+  }
   oled.setCursor(68, 15); oled.printf("G:%.0f", gGyroAbs);
   oled.setCursor(0, 25);  oled.printf("P:%.0fmW", gPowerMW);
   oled.setCursor(68, 25); oled.printf("C:%.0fmA", gCurrentMA);
@@ -999,6 +1007,12 @@ static void pageDashboard() {
 
 static void pageTemp() {
   drawTitleBar("TEMPERATURA");
+  if (!(moduleTemp && isfinite(gTemp))) {
+    drawCentered("NTC indisponibil", 24, 1);
+    drawCentered("Verifica GPIO21", 38, 1);
+    return;
+  }
+
   char buf[10];
   snprintf(buf, sizeof(buf), "%.1f", gTemp);
   int numW = strlen(buf) * 18;
@@ -1271,43 +1285,92 @@ void setup() {
   Serial.printf("[GYRO]   %s\n", hasGyro ? "OK" : "MISSING/UNKNOWN");
 
   // --- WiFi ---
+  bool wifiConnected = false;
+  const uint32_t wifiConnectTimeoutMs = 12000;
+  const uint8_t wifiRetryDelaySec = 3;
+  const size_t wifiCount = min(WIFI_SSID.size(), WIFI_PASS.size());
 
-  for(int i=0 ; i<= WIFI_SSID.size(); i++) {
-  
-
+  for (size_t i = 0; i < wifiCount; i++) {
     Serial.printf("[WiFi]   Trying SSID: %s\n", WIFI_SSID[i]);
 
-  if (hasOLED) {
-    oled.clearDisplay();
-    oled.setCursor(0, 0);
-    oled.println("WiFi...");
-    oled.println("Connecting to:");
-    oled.println(WIFI_SSID[i]);
-    oled.display();
-  }
-
-  if (WiFi.begin(WIFI_SSID[i], WIFI_PASS[i]) == WL_CONNECTED) {
-    syncClockFromNtp();
-    Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
     if (hasOLED) {
       oled.clearDisplay();
       oled.setCursor(0, 0);
-      oled.println("WiFi OK");
-      oled.println(WiFi.localIP().toString());
-      oled.println("\nMQTT: broker.emqx.io");
+      oled.println("WiFi...");
+      oled.println("Connecting to:");
+      oled.println(WIFI_SSID[i]);
       oled.display();
+    }
+
+    WiFi.begin(WIFI_SSID[i], WIFI_PASS[i]);
+    uint32_t startedAt = millis();
+    int lastShownRemaining = -1;
+    while (WiFi.status() != WL_CONNECTED && (millis() - startedAt) < wifiConnectTimeoutMs) {
+      uint32_t elapsedMs = millis() - startedAt;
+      int remainingSec = (int)((wifiConnectTimeoutMs - elapsedMs + 999) / 1000);
+      if (remainingSec < 0) remainingSec = 0;
+
+      if (remainingSec != lastShownRemaining) {
+        lastShownRemaining = remainingSec;
+        Serial.printf("[WiFi] Connecting to %s... %d second(s) left\n", WIFI_SSID[i], remainingSec);
+        if (hasOLED) {
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println("WiFi...");
+          oled.println("Connecting to:");
+          oled.println(WIFI_SSID[i]);
+          oled.printf("Timeout in: %ds", remainingSec);
+          oled.display();
+        }
+      }
+
+      delay(200);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      syncClockFromNtp();
+      Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+
+      if (hasOLED) {
+        oled.clearDisplay();
+        oled.setCursor(0, 0);
+        oled.println("WiFi OK");
+        oled.println(WiFi.localIP().toString());
+        oled.println("\nMQTT: broker.emqx.io");
+        oled.display();
+      }
       break;
     }
-  } else if (i < WIFI_SSID.size()) {
-    Serial.printf("[WiFi] Nereusit — Se incearca urmatoarea varianta: %s", WIFI_SSID[i]);
-    if(hasOLED)
-    {oled.clearDisplay();
-    oled.printf("[WiFi] Nereusit — Se incearca varianta %d %s", i,WIFI_SSID[i]);
-  
-  }else{
-    oled.println("[WiFi] Nereusit - MOD OFFLINE");
+
+    WiFi.disconnect();
+
+    if (i + 1 < wifiCount) {
+      Serial.printf("[WiFi] Failed, trying next SSID: %s\n", WIFI_SSID[i + 1]);
+      for (int sec = wifiRetryDelaySec; sec > 0; sec--) {
+        Serial.printf("[WiFi] Next try in %d second(s)...\n", sec);
+        if (hasOLED) {
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println("WiFi failed");
+          oled.println("Retry in:");
+          oled.printf("%d sec", sec);
+          oled.display();
+        }
+        delay(1000);
+      }
+    }
   }
-}
+
+  if (!wifiConnected) {
+    Serial.println("[WiFi] Failed - OFFLINE MODE");
+    if (hasOLED) {
+      oled.clearDisplay();
+      oled.setCursor(0, 0);
+      oled.println("WiFi failed");
+      oled.println("OFFLINE MODE");
+      oled.display();
+    }
   }
   // --- MQTT ---
   mqttClientId = "esp32-hs-" + String((uint32_t)ESP.getEfuseMac(), HEX);
@@ -1368,8 +1431,13 @@ void loop() {
     drawPage();
 
     // Serial log
-    Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
-      gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
+    if (moduleTemp && isfinite(gTemp)) {
+      Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
+        gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
+    } else {
+      Serial.printf("[%s] T=N/A TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
+        gTimestamp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
+    }
   }
 
   delay(10);
