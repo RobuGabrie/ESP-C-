@@ -9,21 +9,25 @@
  *   - SSD1306 0.96" OLED 128x64   (I2C 0x3C)
  *   - INA219 current/power monitor (I2C 0x40)
  *   - DS1307 RTC module HW-111    (I2C 0x68)
- *   - PCF8591 ADC/DAC HW-011      (I2C 0x48)
+ *   - 10k NTC thermistor divider on GPIO0 (ADC)
+ *   - LSM6DS3-compatible gyro      (I2C 0x6A)
  *   - LG INR18650MH1 battery      (3.6V nom, 3200mAh)
  *   - 2x tactile push buttons
  *
  * WIRING:
  *   I2C Bus:
- *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, PCF8591
- *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, PCF8591
+ *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3
+ *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3
+ *   Thermistor divider:
+ *     3.3V -> 10k resistor -> GPIO0 -> 10k NTC -> GND
  *   Buttons (active LOW, internal pull-up):
  *     ESP32 GPIO3 --> Button NEXT --> GND
  *     ESP32 GPIO4 --> Button PREV --> GND
  *
  * FIXES vs original:
- *   - PCF8591: triple-read with inter-read delay for stable ADC values
- *   - I2C clock set to 100kHz (PCF8591 & DS1307 are slow devices)
+ *   - Migrated thermistor to direct ADC read on GPIO0
+ *   - Added LSM6DS3 gyroscope readout over I2C
+ *   - I2C clock set to 100kHz for DS1307 compatibility
  *   - INA219: explicit 16V/400mA calibration for battery monitoring
  *   - Removed WebServer/HTTP/dashboard — MQTT + OLED only
  *   - Reduced RAM: smaller JSON buffer, no HTML blob
@@ -51,12 +55,15 @@
 #include <freertos/task.h>
 #include <esp_freertos_hooks.h>
 #include <Preferences.h>
-
+#include <vector>
 // ================================================================
 // CONFIGURATION
 // ================================================================
-static const char* WIFI_SSID = "DIGI";
-static const char* WIFI_PASS = "27mc2004ca";
+
+
+static const std::vector<const char*> WIFI_SSID = {"stanislav", "Network", "DIGI", "DIGI-75hC"};
+static const std::vector<const char*> WIFI_PASS = {"stas1524", "19911313", "27mc2004ca", "9T2Du96euz"};
+  
 
 static const float BATTERY_CAPACITY = 3200.0f;  // mAh
 static const float BATT_REST_CURRENT_MA = 80.0f;  // ~C/40 for 3200mAh cell
@@ -87,32 +94,33 @@ static const uint8_t BTN_NEXT = 3;
 static const uint8_t BTN_PREV = 4;
 
 // GPIO snapshot pins to publish as raw digital states.
-static const uint8_t GPIO_PUBLISH_PINS[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 18, 19, 20, 21};
+// GPIO18/19 are native USB D-/D+ on ESP32-C3; avoid probing them as GPIO.
+static const uint8_t GPIO_PUBLISH_PINS[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21};
 static const size_t GPIO_PUBLISH_PIN_COUNT = sizeof(GPIO_PUBLISH_PINS) / sizeof(GPIO_PUBLISH_PINS[0]);
 
 // ================================================================
-// I2C
+// I2C + ANALOG
 // ================================================================
-static const uint8_t  PCF8591_ADDR  = 0x48;
-static const uint32_t I2C_FREQ      = 100000;  // 100kHz — safe for PCF8591 & DS1307
+static const uint32_t I2C_FREQ      = 100000;  // 100kHz — safe for DS1307
+static const uint8_t THERM_PIN      = 0;       // GPIO0: divider midpoint
+static const float ADC_MAX          = 4095.0f; // ESP32-C3 12-bit ADC
 
 // ================================================================
-// PCF8591 CHANNEL MAP (HW-011, verified empirically)
+// NTC THERMISTOR (10k divider)
+// Circuit: 3.3V -> 10k fixed -> ADC(GPIO0) -> 10k NTC -> GND
 // ================================================================
-static const uint8_t CH_LDR   = 0;   // LDR (light)
-static const uint8_t CH_THERM = 1;   // NTC thermistor (temperature)
-static const uint8_t CH_EXT   = 2;   // External / unused
-static const uint8_t CH_POT   = 3;   // Potentiometer
-
-// ================================================================
-// NTC THERMISTOR (typical 10k NTC on HW-011)
-// Circuit: VCC -> R_fixed -> ADC -> NTC -> GND
-// R_fixed is 1kΩ on this HW-011 module (not 10k!)
-// ================================================================
-static const float R_FIXED   = 1000.0f;
+static const float R_FIXED   = 10000.0f;
 static const float R_NOMINAL = 10000.0f;
 static const float T_NOMINAL = 25.0f;
 static const float B_COEFF   = 3950.0f;
+
+// LSM6DS3/compatible gyro sensor over I2C.
+static const uint8_t GYRO_I2C_ADDR = 0x6A;
+static const uint8_t GYRO_WHO_AM_I_REG = 0x0F;
+static const uint8_t GYRO_WHO_AM_I_VAL = 0x69;
+static const uint8_t GYRO_CTRL2_G = 0x11;
+static const uint8_t GYRO_OUTX_L_G = 0x22;
+static const float GYRO_SCALE_DPS = 0.07f;  // FS=2000 dps => 70 mdps/LSB
 
 // ================================================================
 // DISPLAY & TIMING
@@ -138,17 +146,20 @@ static Preferences      prefs;
 static bool hasOLED   = false;
 static bool hasINA219 = false;
 static bool hasRTC    = false;
-static bool hasPCF    = false;
+static bool hasGyro   = false;
 
 // ================================================================
 // SENSOR DATA
 // ================================================================
 static float    gTemp       = 0.0f;
-static uint8_t  gLightRaw   = 0;
-static uint8_t  gThermRaw   = 0;
-static uint8_t  gExtRaw     = 0;
-static uint8_t  gPotRaw     = 0;
-static float    gLightPct   = 0.0f;
+static uint16_t gThermRaw   = 0;
+static int16_t  gGyroRawX   = 0;
+static int16_t  gGyroRawY   = 0;
+static int16_t  gGyroRawZ   = 0;
+static float    gGyroX      = 0.0f;
+static float    gGyroY      = 0.0f;
+static float    gGyroZ      = 0.0f;
+static float    gGyroAbs    = 0.0f;
 static int16_t  gRSSI       = 0;
 static float    gVoltage    = 0.0f;
 static float    gCurrentMA  = 0.0f;
@@ -209,7 +220,7 @@ static String mqttClientId;
 
 // Module enable/disable (toggled via MQTT)
 static bool moduleTemp    = true;
-static bool moduleLight   = true;
+static bool moduleGyro    = true;
 static bool moduleCPU     = true;
 static bool moduleCurrent = true;
 static volatile bool moduleCpuStress = false;
@@ -220,7 +231,8 @@ static void drawPage();
 static float measureCpuLoadPct();
 static void buildRawGpioJSON(char* buf, size_t bufSize);
 static void printDegC();
-static bool readNtpTimestamp(char* out, size_t outSize);
+static bool initGyro();
+static bool readGyro();
 static bool cpuIdleHook();
 static bool getCpuLoadFromRuntimeStats(float& loadOut);
 static float getCpuLoadFromIdleHook();
@@ -259,18 +271,6 @@ static void syncClockFromNtp() {
       ));
     }
   }
-}
-
-static bool readNtpTimestamp(char* out, size_t outSize) {
-  time_t now = time(nullptr);
-  if (now < 1700000000) return false;
-
-  struct tm tmNow;
-  localtime_r(&now, &tmNow);
-  snprintf(out, outSize, "%04d-%02d-%02d %02d:%02d:%02d",
-           tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
-           tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
-  return true;
 }
 
 static void loadBatteryState() {
@@ -353,13 +353,13 @@ static void updateOledRawLog() {
   // No GPIO edge this second: rotate compact raw snapshots (same sources as MQTT raw).
   switch (gRawSnapshotPhase % 3) {
     case 0:
-      appendOledLog("PCF LDR:%03u TH:%03u", gLightRaw, gThermRaw);
+      appendOledLog("TH RAW:%4u T:%4.1f", gThermRaw, gTemp);
       break;
     case 1:
-      appendOledLog("PCF EXT:%03u POT:%03u", gExtRaw, gPotRaw);
+      appendOledLog("GYR X:%4.0f Y:%4.0f", gGyroX, gGyroY);
       break;
     default:
-      appendOledLog("INA BUS:%05u CUR:%d", gInaBusRaw, gInaCurrRaw);
+      appendOledLog("GYR Z:%4.0f INA:%5u", gGyroZ, gInaBusRaw);
       break;
   }
   gRawSnapshotPhase++;
@@ -486,58 +486,21 @@ void IRAM_ATTR isrBtnNext() { isrNextFlag = true; }
 void IRAM_ATTR isrBtnPrev() { isrPrevFlag = true; }
 
 // ================================================================
-// PCF8591 — STABLE READ
-//
-// Control byte format (written to PCF8591):
-//   Bit 7:   0
-//   Bit 6:   1 = analog output enable (REQUIRED on HW-011!)
-//   Bit 5-4: 00 = four single-ended inputs
-//   Bit 3:   0
-//   Bit 2:   0 = no auto-increment
-//   Bit 1-0: channel number (0-3)
-//
-// Without bit 6 set, the ADC returns 0xFF on all channels.
-//
-// The first byte read after a channel switch is always the
-// PREVIOUS conversion result. We request 2 bytes in one
-// transaction: discard byte 0, keep byte 1.
-// Two back-to-back transactions ensure full settling.
-// ================================================================
-static uint8_t readPCF8591Stable(uint8_t channel) {
-  uint8_t ctrl = 0x40 | (channel & 0x03);  // bit6=1 (output enable) + channel
-
-  // Transaction 1: switch channel, discard stale byte, get first conversion
-  Wire.beginTransmission(PCF8591_ADDR);
-  Wire.write(ctrl);
-  if (Wire.endTransmission() != 0) return 0;
-
-  delay(1);  // 1ms — let S&H capacitor settle after channel switch
-
-  Wire.requestFrom((uint8_t)PCF8591_ADDR, (uint8_t)2);
-  if (Wire.available()) Wire.read();  // byte 0: previous channel's result — discard
-  uint8_t val = Wire.available() ? Wire.read() : 0;  // byte 1: first conversion on new channel
-
-  // Transaction 2: same channel, fully settled value
-  Wire.requestFrom((uint8_t)PCF8591_ADDR, (uint8_t)2);
-  if (Wire.available()) Wire.read();  // discard
-  val = Wire.available() ? Wire.read() : val;  // stable result
-
-  return val;
-}
-
-// ================================================================
-// THERMISTOR — ADC TO TEMPERATURE (Steinhart-Hart / B-parameter)
-//
-// Verified HW-011 circuit: VCC -> R_fixed -> ADC pin -> NTC -> GND
-//   Warm = NTC drops = ADC voltage drops = adc value drops
-//   R_ntc = R_fixed * adc / (255 - adc)
+// THERMISTOR — ADC TO TEMPERATURE (B-parameter)
 // ================================================================
 static float readThermistor() {
-  uint8_t adc = readPCF8591Stable(CH_THERM);
+  uint32_t sum = 0;
+  constexpr uint8_t samples = 8;
+  for (uint8_t i = 0; i < samples; i++) {
+    sum += analogRead(THERM_PIN);
+    delayMicroseconds(250);
+  }
 
-  if (adc <= 1 || adc >= 254) return -99.0f;
+  gThermRaw = (uint16_t)(sum / samples);
+  if (gThermRaw <= 1 || gThermRaw >= (uint16_t)(ADC_MAX - 1.0f)) return -99.0f;
 
-  float rNtc = R_FIXED * (float)adc / (255.0f - (float)adc);
+  float adc = (float)gThermRaw;
+  float rNtc = R_FIXED * adc / (ADC_MAX - adc);
 
   // B-parameter Steinhart equation
   float steinhart = logf(rNtc / R_NOMINAL);
@@ -549,6 +512,54 @@ static float readThermistor() {
   if (steinhart < -40.0f || steinhart > 125.0f) return -99.0f;
 
   return steinhart;
+}
+
+static bool i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool i2cReadRegs(uint8_t addr, uint8_t reg, uint8_t* data, size_t len) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  size_t read = Wire.requestFrom(addr, (uint8_t)len);
+  if (read < len) return false;
+  for (size_t i = 0; i < len; i++) {
+    data[i] = Wire.read();
+  }
+  return true;
+}
+
+static bool initGyro() {
+  uint8_t who = 0;
+  if (!i2cReadRegs(GYRO_I2C_ADDR, GYRO_WHO_AM_I_REG, &who, 1)) return false;
+  if (who != GYRO_WHO_AM_I_VAL) return false;
+
+  // ODR=104Hz, FS=2000dps, BW default.
+  if (!i2cWriteReg(GYRO_I2C_ADDR, GYRO_CTRL2_G, 0x4C)) return false;
+  delay(10);
+  return true;
+}
+
+static bool readGyro() {
+  uint8_t buf[6] = {0};
+  if (!i2cReadRegs(GYRO_I2C_ADDR, (uint8_t)(GYRO_OUTX_L_G | 0x80), buf, sizeof(buf))) {
+    return false;
+  }
+
+  gGyroRawX = (int16_t)((buf[1] << 8) | buf[0]);
+  gGyroRawY = (int16_t)((buf[3] << 8) | buf[2]);
+  gGyroRawZ = (int16_t)((buf[5] << 8) | buf[4]);
+
+  gGyroX = gGyroRawX * GYRO_SCALE_DPS;
+  gGyroY = gGyroRawY * GYRO_SCALE_DPS;
+  gGyroZ = gGyroRawZ * GYRO_SCALE_DPS;
+  gGyroAbs = sqrtf(gGyroX * gGyroX + gGyroY * gGyroY + gGyroZ * gGyroZ);
+  return true;
 }
 
 // ================================================================
@@ -576,27 +587,7 @@ static bool readINA219Register16(uint8_t reg, uint16_t& out) {
 // ================================================================
 // WIFI CONNECT (with TX power fallback)
 // ================================================================
-static bool connectWiFiWithTxPower(wifi_power_t txPower, uint8_t maxTries = 30) {
-  WiFi.disconnect(true, true);
-  delay(120);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.setTxPower(txPower);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  Serial.printf("[WiFi] Connecting to %s (tx=%d)", WIFI_SSID, (int)txPower);
-  uint8_t tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < maxTries) {
-    delay(500);
-    Serial.print(".");
-    tries++;
-  }
-  Serial.println();
-
-  return WiFi.status() == WL_CONNECTED;
-}
 
 // ================================================================
 // READ ALL SENSORS
@@ -626,21 +617,15 @@ static void readSensors() {
   }
   gUptime = millis() / 1000;
 
-  // --- PCF8591: read only enabled channels ---
-  if (hasPCF && moduleTemp) {
-    gThermRaw = readPCF8591Stable(CH_THERM);
+  if (moduleTemp) {
     gTemp = readThermistor();
   }
 
-  if (hasPCF && moduleLight) {
-    gLightRaw = readPCF8591Stable(CH_LDR);
-    gLightPct = ((255 - gLightRaw) / 255.0f) * 100.0f;  // lower ADC = more light
-  }
-
-  // Keep raw debug channels live only when at least one PCF module is enabled.
-  if (hasPCF && (moduleTemp || moduleLight)) {
-    gExtRaw = readPCF8591Stable(CH_EXT);
-    gPotRaw = readPCF8591Stable(CH_POT);
+  if (hasGyro && moduleGyro) {
+    if (!readGyro()) {
+      gGyroX = gGyroY = gGyroZ = 0.0f;
+      gGyroAbs = 0.0f;
+    }
   }
 
   // --- INA219 ---
@@ -773,12 +758,19 @@ static void buildJSON(char* buf, size_t bufSize) {
   doc["up"]   = gUptime;
   if (moduleTemp) doc["temp"] = roundf(gTemp * 10.0f) / 10.0f;
   else            doc["temp"] = nullptr;
+  doc["temp_raw"] = moduleTemp ? gThermRaw : 0;
 
-  if (moduleLight) doc["ldr"] = gLightRaw;
-  else             doc["ldr"] = nullptr;
-
-  if (moduleLight) doc["ldr_pct"] = roundf(gLightPct * 10.0f) / 10.0f;
-  else             doc["ldr_pct"] = nullptr;
+  if (moduleGyro && hasGyro) {
+    doc["gx"] = roundf(gGyroX * 10.0f) / 10.0f;
+    doc["gy"] = roundf(gGyroY * 10.0f) / 10.0f;
+    doc["gz"] = roundf(gGyroZ * 10.0f) / 10.0f;
+    doc["gabs"] = roundf(gGyroAbs * 10.0f) / 10.0f;
+  } else {
+    doc["gx"] = nullptr;
+    doc["gy"] = nullptr;
+    doc["gz"] = nullptr;
+    doc["gabs"] = nullptr;
+  }
 
   doc["rssi"]   = gRSSI;
   doc["cpu"]    = (int)roundf(gCpuLoad);
@@ -823,15 +815,18 @@ static void buildRawGpioJSON(char* buf, size_t bufSize) {
     gpio[key] = digitalRead(pin);
   }
 
-  JsonObject pcfRaw = doc["pcf8591_raw"].to<JsonObject>();
-  if (moduleLight)             pcfRaw["ch0_ldr"] = gLightRaw;
-  else                         pcfRaw["ch0_ldr"] = nullptr;
-  if (moduleTemp)              pcfRaw["ch1_therm"] = gThermRaw;
-  else                         pcfRaw["ch1_therm"] = nullptr;
-  if (moduleTemp || moduleLight) pcfRaw["ch2_ext"] = gExtRaw;
-  else                           pcfRaw["ch2_ext"] = nullptr;
-  if (moduleTemp || moduleLight) pcfRaw["ch3_pot"] = gPotRaw;
-  else                           pcfRaw["ch3_pot"] = nullptr;
+  doc["therm_raw"] = moduleTemp ? gThermRaw : 0;
+
+  JsonObject gyroRaw = doc["gyro_raw"].to<JsonObject>();
+  if (moduleGyro && hasGyro) {
+    gyroRaw["x"] = gGyroRawX;
+    gyroRaw["y"] = gGyroRawY;
+    gyroRaw["z"] = gGyroRawZ;
+  } else {
+    gyroRaw["x"] = nullptr;
+    gyroRaw["y"] = nullptr;
+    gyroRaw["z"] = nullptr;
+  }
 
   JsonObject inaRaw = doc["ina219_raw"].to<JsonObject>();
   if (moduleCurrent) inaRaw["bus"] = gInaBusRaw;
@@ -869,7 +864,7 @@ static void publishState() {
   JsonDocument doc;
   JsonObject m = doc["modules"].to<JsonObject>();
   m["temperature"] = moduleTemp;
-  m["light"]       = moduleLight;
+  m["gyro"]        = moduleGyro;
   m["cpu"]         = moduleCPU;
   m["current"]     = moduleCurrent;
   m["cpu_stress"]  = moduleCpuStress;
@@ -881,6 +876,8 @@ static void publishState() {
 // MQTT MESSAGE HANDLER
 // ================================================================
 static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  (void)topic;
+
   // Stack-allocate: no heap fragmentation
   char msg[128];
   size_t len = min((unsigned int)(sizeof(msg) - 1), length);
@@ -898,7 +895,8 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   bool en = doc["enabled"] | true;
 
   if      (strcmp(mod, "temperature") == 0)  moduleTemp    = en;
-  else if (strcmp(mod, "light") == 0)        moduleLight   = en;
+  else if (strcmp(mod, "gyro") == 0)         moduleGyro    = en;
+  else if (strcmp(mod, "cpu") == 0)          moduleCPU     = en;
   else if (strcmp(mod, "current") == 0)      moduleCurrent = en;
   else if (strcmp(mod, "cpu_stress") == 0)   moduleCpuStress = en;
 
@@ -988,7 +986,7 @@ static void pageDashboard() {
 
   oled.setTextSize(1);
   oled.setCursor(0, 15);  oled.printf("T:%.1f", gTemp); printDegC();
-  oled.setCursor(68, 15); oled.printf("L:%.0f%%", gLightPct);
+  oled.setCursor(68, 15); oled.printf("G:%.0f", gGyroAbs);
   oled.setCursor(0, 25);  oled.printf("P:%.0fmW", gPowerMW);
   oled.setCursor(68, 25); oled.printf("C:%.0fmA", gCurrentMA);
   oled.setCursor(0, 35);  oled.printf("R:%ddBm", gRSSI);
@@ -1015,20 +1013,15 @@ static void pageTemp() {
   drawProgressBar(4, 48, 120, 8, pct);
 }
 
-static void pageLight() {
-  drawTitleBar("LUMINA");
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.0f", gLightPct);
-  int numW = strlen(buf) * 18;
-  int sx = (128 - numW - 14) / 2;
-  if (sx < 0) sx = 0;
-  oled.setTextSize(3); oled.setCursor(sx, 16); oled.print(buf);
-  oled.setTextSize(2); oled.setCursor(sx + numW + 2, 20); oled.print("%");
+static void pageGyro() {
+  drawTitleBar("GIROSCOP");
   oled.setTextSize(1);
-  char raw[16];
-  snprintf(raw, sizeof(raw), "Brut: %d / 255", gLightRaw);
-  drawCentered(raw, 42, 1);
-  drawProgressBar(4, 52, 120, 8, gLightPct);
+  oled.setCursor(0, 16); oled.printf("X:%7.1f dps", gGyroX);
+  oled.setCursor(0, 26); oled.printf("Y:%7.1f dps", gGyroY);
+  oled.setCursor(0, 36); oled.printf("Z:%7.1f dps", gGyroZ);
+  oled.setCursor(0, 46); oled.printf("ABS:%5.1f dps", gGyroAbs);
+  float gyroPct = constrain(gGyroAbs / 10.0f, 0.0f, 100.0f);
+  drawProgressBar(4, 54, 120, 8, gyroPct);
 }
 
 static void pageWiFi() {
@@ -1135,10 +1128,10 @@ static void pageRawLog() {
       if (state) gpioHigh++;
     }
 
-    oled.setCursor(0, 14); oled.printf("LDR:%3u THM:%3u", gLightRaw, gThermRaw);
-    oled.setCursor(0, 24); oled.printf("EXT:%3u POT:%3u", gExtRaw, gPotRaw);
-    oled.setCursor(0, 34); oled.printf("BUS:%5u", gInaBusRaw);
-    oled.setCursor(0, 44); oled.printf("CUR:%5d P:%5u", gInaCurrRaw, gInaPowRaw);
+    oled.setCursor(0, 14); oled.printf("THM RAW:%4u", gThermRaw);
+    oled.setCursor(0, 24); oled.printf("GYR X:%5d", gGyroRawX);
+    oled.setCursor(0, 34); oled.printf("GYR Y:%5d", gGyroRawY);
+    oled.setCursor(0, 44); oled.printf("GYR Z:%5d", gGyroRawZ);
     oled.setCursor(0, 54); oled.printf("GPIO HIGH:%2d/%2d", gpioHigh, (int)GPIO_PUBLISH_PIN_COUNT);
     return;
   }
@@ -1167,7 +1160,7 @@ static void drawPage() {
   switch (page) {
     case 0: pageDashboard(); break;
     case 1: pageTemp();      break;
-    case 2: pageLight();     break;
+    case 2: pageGyro();      break;
     case 3: pageWiFi();      break;
     case 4: pageCPU();       break;
     case 5: pageVoltage();   break;
@@ -1189,10 +1182,13 @@ void setup() {
   delay(300);
   Serial.println("\n=== Hard&Soft Task 1 — MQTT Monitor ===\n");
 
-  // --- I2C at 100kHz (PCF8591 max is 100kHz, DS1307 too) ---
+  // --- I2C at 100kHz (DS1307-compatible) ---
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(I2C_FREQ);
   Wire.setTimeOut(50);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(THERM_PIN, ADC_11db);
 
   // --- CPU load hook (fallback when runtime stats are unavailable) ---
   bool idleHookOk = false;
@@ -1225,9 +1221,9 @@ void setup() {
       Serial.printf("  0x%02X", addr);
       if (addr == 0x3C) Serial.print(" SSD1306");
       if (addr == 0x40) Serial.print(" INA219");
-      if (addr == 0x48) Serial.print(" PCF8591");
       if (addr == 0x50) Serial.print(" AT24C32");
       if (addr == 0x68) Serial.print(" DS1307");
+      if (addr == 0x6A) Serial.print(" LSM6DS3");
       Serial.println();
     }
   }
@@ -1269,49 +1265,28 @@ void setup() {
   }
   Serial.printf("[RTC]    %s\n", hasRTC ? "OK" : "MISSING");
 
-  // --- PCF8591 ---
-  hasPCF = i2cProbe(PCF8591_ADDR);
-  Serial.printf("[PCF]    %s\n", hasPCF ? "OK" : "MISSING");
-
-  if (hasPCF) {
-    Serial.println("[PCF] Channel diagnostic (stable reads):");
-    for (int ch = 0; ch < 4; ch++) {
-      uint8_t val = readPCF8591Stable(ch);
-      Serial.printf("  AIN%d = %3d", ch, val);
-      if (ch == CH_POT)   Serial.print("  (pot)");
-      if (ch == CH_LDR)   Serial.print("  (LDR)");
-      if (ch == CH_THERM) Serial.print("  (therm)");
-      if (ch == CH_EXT)   Serial.print("  (ext)");
-      Serial.println();
-    }
-    Serial.println("  Cover LDR or warm thermistor to verify channels\n");
-  }
+  // --- Gyroscope ---
+  hasGyro = i2cProbe(GYRO_I2C_ADDR) && initGyro();
+  if (!hasGyro) moduleGyro = false;
+  Serial.printf("[GYRO]   %s\n", hasGyro ? "OK" : "MISSING/UNKNOWN");
 
   // --- WiFi ---
+
+  for(int i=0 ; i<= WIFI_SSID.size(); i++) {
+  
+
+    Serial.printf("[WiFi]   Trying SSID: %s\n", WIFI_SSID[i]);
+
   if (hasOLED) {
     oled.clearDisplay();
     oled.setCursor(0, 0);
     oled.println("WiFi...");
-    oled.println(WIFI_SSID);
+    oled.println("Connecting to:");
+    oled.println(WIFI_SSID[i]);
     oled.display();
   }
 
-  const wifi_power_t txLevels[] = {
-    WIFI_POWER_8_5dBm,
-    WIFI_POWER_13dBm,
-    WIFI_POWER_19_5dBm
-  };
-
-  bool wifiOk = false;
-  for (size_t i = 0; i < (sizeof(txLevels) / sizeof(txLevels[0])); i++) {
-    if (connectWiFiWithTxPower(txLevels[i])) {
-      wifiOk = true;
-      break;
-    }
-    Serial.println("[WiFi] Retry with different TX power...");
-  }
-
-  if (wifiOk) {
+  if (WiFi.begin(WIFI_SSID[i], WIFI_PASS[i]) == WL_CONNECTED) {
     syncClockFromNtp();
     Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
     if (hasOLED) {
@@ -1321,11 +1296,19 @@ void setup() {
       oled.println(WiFi.localIP().toString());
       oled.println("\nMQTT: broker.emqx.io");
       oled.display();
+      break;
     }
-  } else {
-    Serial.println("[WiFi] FAILED — offline mode");
+  } else if (i < WIFI_SSID.size()) {
+    Serial.printf("[WiFi] Nereusit — Se incearca urmatoarea varianta: %s", WIFI_SSID[i]);
+    if(hasOLED)
+    {oled.clearDisplay();
+    oled.printf("[WiFi] Nereusit — Se incearca varianta %d %s", i,WIFI_SSID[i]);
+  
+  }else{
+    oled.println("[WiFi] Nereusit - MOD OFFLINE");
   }
-
+}
+  }
   // --- MQTT ---
   mqttClientId = "esp32-hs-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
@@ -1385,8 +1368,8 @@ void loop() {
     drawPage();
 
     // Serial log
-    Serial.printf("[%s] T=%.1f L=%d V=%.2f I=%.1f CPU=%.1f%%\n",
-      gTimestamp, gTemp, gLightRaw, gVoltage, gCurrentMA, gCpuLoad);
+    Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
+      gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
   }
 
   delay(10);

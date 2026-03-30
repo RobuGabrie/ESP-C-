@@ -7,8 +7,11 @@ create table if not exists public.sensor_readings (
   device_ts text not null,
   uptime_s integer not null,
   temp_c real,
-  ldr_raw integer,
-  ldr_pct real,
+  therm_raw integer,
+  gyro_x_dps real,
+  gyro_y_dps real,
+  gyro_z_dps real,
+  gyro_abs_dps real,
   rssi_dbm integer,
   cpu_pct real,
   voltage_v real,
@@ -19,10 +22,7 @@ create table if not exists public.sensor_readings (
   battery_min integer,
   ina_bus_raw integer,
   ina_curr_raw integer,
-  ina_pow_raw integer,
-  pcf_therm_raw integer,
-  pcf_ext_raw integer,
-  pcf_pot_raw integer
+  ina_pow_raw integer
 );
 
 -- Quick setup for device inserts over REST.
