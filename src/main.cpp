@@ -368,7 +368,7 @@ static KalmanAxis gKalPitch = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
 static void publishState();
 static void drawPage();
 static float measureCpuLoadPct();
-static void buildRawGpioJSON(char* buf, size_t bufSize);
+static size_t buildRawGpioJSON(char* buf, size_t bufSize);
 static void printDegC();
 static bool initGyro();
 static bool readGyro();
@@ -1592,7 +1592,7 @@ static void readOtherSensors() {
 // ================================================================
 // BUILD JSON — compact, only real data
 // ================================================================
-static void buildJSON(char* buf, size_t bufSize) {
+static size_t buildJSON(char* buf, size_t bufSize) {
   JsonDocument doc;
 
   doc["ts"]   = gTimestamp;
@@ -1676,13 +1676,13 @@ static void buildJSON(char* buf, size_t bufSize) {
   doc["mac"]    = WiFi.macAddress();
   doc["channel"] = (int)WiFi.channel();
 
-  serializeJson(doc, buf, bufSize);
+  return serializeJson(doc, buf, bufSize);
 }
 
 // ================================================================
 // BUILD RAW JSON — exact GPIO + raw sensor values
 // ================================================================
-static void buildRawGpioJSON(char* buf, size_t bufSize) {
+static size_t buildRawGpioJSON(char* buf, size_t bufSize) {
   JsonDocument doc;
   doc["ts"] = gTimestamp;
   doc["up"] = gUptime;
@@ -1755,7 +1755,7 @@ static void buildRawGpioJSON(char* buf, size_t bufSize) {
   if (moduleCurrent) inaRaw["power"] = gInaPowRaw;
   else               inaRaw["power"] = nullptr;
 
-  serializeJson(doc, buf, bufSize);
+  return serializeJson(doc, buf, bufSize);
 }
 
 // ================================================================
@@ -2334,7 +2334,7 @@ void setup() {
   mqttClientId = "esp32-hs-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
-  mqtt.setBufferSize(1024);
+  mqtt.setBufferSize(2048);
   connectMqtt();
 
   loadBatteryState();
@@ -2398,21 +2398,33 @@ void loop() {
 
     // MQTT publish (1Hz)
     if (mqtt.connected()) {
-      char json[384];
-      buildJSON(json, sizeof(json));
-      mqtt.publish(MQTT_TOPIC, json);
+      char json[1024];
+      size_t jsonLen = buildJSON(json, sizeof(json));
+      if (jsonLen >= sizeof(json)) {
+        Serial.printf("[MQTT] DATA JSON truncated (%u >= %u)\n", (unsigned)jsonLen, (unsigned)sizeof(json));
+      } else {
+        mqtt.publish(MQTT_TOPIC, json);
+      }
 
-      char rawJson[768];
-      buildRawGpioJSON(rawJson, sizeof(rawJson));
-      mqtt.publish(MQTT_RAW_TOPIC, rawJson);
+      char rawJson[1536];
+      size_t rawLen = buildRawGpioJSON(rawJson, sizeof(rawJson));
+      if (rawLen >= sizeof(rawJson)) {
+        Serial.printf("[MQTT] RAW JSON truncated (%u >= %u)\n", (unsigned)rawLen, (unsigned)sizeof(rawJson));
+      } else {
+        mqtt.publish(MQTT_RAW_TOPIC, rawJson);
+      }
     } else if (gLocalBrokerStarted && gOfflineServicesActive) {
-      char json[384];
-      buildJSON(json, sizeof(json));
-      localBroker.publish(std::string(MQTT_TOPIC), std::string(json));
+      char json[1024];
+      size_t jsonLen = buildJSON(json, sizeof(json));
+      if (jsonLen < sizeof(json)) {
+        localBroker.publish(std::string(MQTT_TOPIC), std::string(json));
+      }
 
-      char rawJson[768];
-      buildRawGpioJSON(rawJson, sizeof(rawJson));
-      localBroker.publish(std::string(MQTT_RAW_TOPIC), std::string(rawJson));
+      char rawJson[1536];
+      size_t rawLen = buildRawGpioJSON(rawJson, sizeof(rawJson));
+      if (rawLen < sizeof(rawJson)) {
+        localBroker.publish(std::string(MQTT_RAW_TOPIC), std::string(rawJson));
+      }
     }
 
     drawPage();
