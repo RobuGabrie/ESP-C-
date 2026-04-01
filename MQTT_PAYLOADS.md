@@ -12,7 +12,12 @@
 - Module state: `hardandsoft/esp32/state`
 - Commands to device: `hardandsoft/esp32/cmd`
 
-Publish cadence: about once per second for telemetry topics.
+Publish cadence:
+- `data`, `gpio_raw`, `state`: about once per second
+
+IMU realtime stream:
+- WebSocket only, about 60 Hz
+- Endpoint: `ws://<esp_ip>:8001`
 
 ---
 
@@ -69,11 +74,17 @@ Example payload:
 Notes:
 - `temp`, `temperature`, and `ntc_c` are aliases (same value).
 - `imu_addr` is decimal (`0x69` is `105`).
-- `roll`, `pitch`, and `yaw` come from gyro+accelerometer Kalman fusion.
+- `roll`, `pitch`, `yaw`, and quaternion are generated from quaternion-first fusion (`mode="fusion"`) or MPU DMP (`mode="mpu_dmp"`).
 - `heading` uses magnetometer correction when available.
 - `mx`, `my`, `mz` are magnetometer values (null when no magnetometer is present).
 - `mag_present` is `true` only when AK8963 magnetometer is detected (MPU9250 path).
 - If a module is disabled, related values can be `null`.
+
+Frame metadata:
+- `frame`: `right-handed`
+- `axes`: `x:right,y:forward,z:up`
+- `angles`: `degrees`
+- `quat_order`: `wxyz`
 
 ---
 
@@ -156,6 +167,49 @@ Example payload:
   }
 }
 ```
+
+---
+
+## 3b) IMU High-Rate Stream
+Transport: WebSocket (`ws://<esp_ip>:8001`)
+
+Example payload:
+
+```json
+{
+  "up": 1234,
+  "q0": 0.9981,
+  "q1": 0.0124,
+  "q2": -0.0582,
+  "q3": 0.0129,
+  "roll": 1.5,
+  "pitch": -6.7,
+  "yaw": 271.1,
+  "gx": 2.1,
+  "gy": -0.4,
+  "gz": 0.7,
+  "lin_ax": 0.013,
+  "lin_ay": -0.026,
+  "lin_az": 0.004,
+  "vel_x": 0.091,
+  "vel_y": -0.002,
+  "vel_z": 0.000,
+  "pos_x": 0.341,
+  "pos_y": -0.043,
+  "pos_z": 0.010,
+  "dt_ms": 16.65,
+  "stationary": false,
+  "mode": "fusion",
+  "frame": "right-handed",
+  "axes": "x:right,y:forward,z:up",
+  "angles": "degrees",
+  "quat_order": "wxyz"
+}
+```
+
+Notes:
+- For VR, use this high-rate WebSocket stream, not the 1 Hz telemetry topic.
+- `lin_ax/vel_x/pos_x` are relative motion estimates and can drift over time.
 
 ---
 

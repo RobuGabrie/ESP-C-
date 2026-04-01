@@ -47,6 +47,7 @@
 #include <PubSubClient.h>
 #include <Thermistor.h>
 #include <sMQTTBroker.h>
+#include <WebSocketsServer.h>
 #include <qrcode.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -58,6 +59,11 @@
 #include <freertos/task.h>
 #include <esp_freertos_hooks.h>
 #include <Preferences.h>
+#include <SparkFunMPU9250-DMP.h>
+
+extern "C" int min(int a, int b) {
+  return (a < b) ? a : b;
+}
 
 // ================================================================
 // CONFIGURATION
@@ -97,6 +103,8 @@ static const char* MQTT_CMD_TOPIC   = "hardandsoft/esp32/cmd";
 static const char* MQTT_STATE_TOPIC = "hardandsoft/esp32/state";
 static const char* MQTT_USER        = "emqx";
 static const char* MQTT_PASS_MQTT   = "public";
+static const uint32_t IMU_PUBLISH_INTERVAL_MS = 16;  // ~60Hz for smoother VR rendering
+static const uint16_t IMU_WS_PORT = 8001;
 
 // ================================================================
 // PINS
@@ -190,10 +198,17 @@ static const uint8_t GYRO_STILL_REQUIRED_SAMPLES = 6;
 static const float KALMAN_Q_ANGLE = 0.001f;
 static const float KALMAN_Q_BIAS = 0.003f;
 static const float KALMAN_R_MEASURE = 0.03f;
-static const float YAW_MAG_BLEND = 0.02f;
+static const float YAW_MAG_BLEND_MIN = 0.03f;
+static const float YAW_MAG_BLEND_MAX = 0.14f;
+static const float QUAT_ACC_GAIN = 1.8f;
+static const float QUAT_MAG_GAIN = 1.4f;
 
 static const uint8_t OLED_TITLE_H = 16;
 static const uint8_t OLED_TITLE_TEXT_Y = 4;
+static const signed char orientationDefault[9] = {0, 1, 0, 0, 0, 1, 1, 0, 0};
+// SparkFun DMP path can hang on some ESP32-C3 + MPU setups during boot.
+// Keep fallback to register fusion if DMP init fails.
+#define USE_MPU_DMP 1
 
 // ================================================================
 // DISPLAY & TIMING
@@ -214,6 +229,8 @@ static WiFiClient       espClient;
 static PubSubClient     mqtt(espClient);
 static Preferences      prefs;
 static sMQTTBroker      localBroker;
+static WebSocketsServer imuWs(IMU_WS_PORT);
+static MPU9250_DMP      mpu;
 
 // ================================================================
 // DEVICE STATUS FLAGS (set during setup, never change after)
@@ -261,8 +278,28 @@ static float    gRoll       = 0.0f;
 static float    gPitch      = 0.0f;
 static float    gYaw        = 0.0f;
 static float    gHeading    = 0.0f;
+static float    gQuat0      = 1.0f;
+static float    gQuat1      = 0.0f;
+static float    gQuat2      = 0.0f;
+static float    gQuat3      = 0.0f;
+static float    gLinAccX    = 0.0f;
+static float    gLinAccY    = 0.0f;
+static float    gLinAccZ    = 0.0f;
+static float    gVelX       = 0.0f;
+static float    gVelY       = 0.0f;
+static float    gVelZ       = 0.0f;
+static float    gPosX       = 0.0f;
+static float    gPosY       = 0.0f;
+static float    gPosZ       = 0.0f;
+static float    gGravityX   = 0.0f;
+static float    gGravityY   = 0.0f;
+static float    gGravityZ   = 1.0f;
 static bool     gFusionSeeded = false;
 static uint32_t gLastFusionUs = 0;
+static uint32_t gLastMotionUs = 0;
+static uint8_t  gMotionStillCount = 0;
+static bool     gMotionSeeded = false;
+static float    gMotionDtMs = 0.0f;
 static uint32_t gLastMagReadMs = 0;
 static float    gMagAdjX    = 1.0f;
 static float    gMagAdjY    = 1.0f;
@@ -329,18 +366,21 @@ static uint32_t gLastI2cScanMs = 0;
 // Sensor read interval tracking
 static uint32_t lastSensorRead = 0;    // Other sensors: 1Hz
 static uint32_t lastOtherSensorRead = 0;
+static uint32_t lastImuPublishMs = 0;
 
 // Button ISR flags
 static volatile bool isrNextFlag = false;
 static volatile bool isrPrevFlag = false;
 
-// Gyro ISR flag (data ready from MPU9250/6500)
-static volatile bool gyroDataReadyFlag = false;
+// Gyro ISR event counter (data ready from MPU9250/6500)
+static volatile uint16_t gyroDataReadyCount = 0;
 static uint32_t gLastGyroReadMs = 0;
 static uint32_t gIgnoreButtonsUntilMs = 0;
 static bool gOfflineServicesActive = false;
 static bool gLocalBrokerStarted = false;
 static bool gWasWifiConnected = false;
+static bool gMpuDmpActive = false;
+static uint16_t gImuWsClientCount = 0;
 
 // MQTT client ID
 static String mqttClientId;
@@ -368,6 +408,9 @@ static KalmanAxis gKalPitch = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
 static void publishState();
 static void drawPage();
 static float measureCpuLoadPct();
+static void onImuWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
+static void updateEulerFromQuaternion();
+static size_t buildImuJSON(char* buf, size_t bufSize);
 static size_t buildRawGpioJSON(char* buf, size_t bufSize);
 static void printDegC();
 static bool initGyro();
@@ -414,6 +457,106 @@ static float normalize360(float a) {
   return a;
 }
 
+static void updateEulerFromQuaternion() {
+  const float q0 = gQuat0;
+  const float q1 = gQuat1;
+  const float q2 = gQuat2;
+  const float q3 = gQuat3;
+
+  const float sinr_cosp = 2.0f * (q0 * q1 + q2 * q3);
+  const float cosr_cosp = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
+  gRoll = atan2f(sinr_cosp, cosr_cosp) * 57.29578f;
+
+  const float sinp = 2.0f * (q0 * q2 - q3 * q1);
+  if (fabsf(sinp) >= 1.0f) {
+    gPitch = copysignf(90.0f, sinp);
+  } else {
+    gPitch = asinf(sinp) * 57.29578f;
+  }
+
+  const float siny_cosp = 2.0f * (q0 * q3 + q1 * q2);
+  const float cosy_cosp = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
+  gYaw = normalize360(atan2f(siny_cosp, cosy_cosp) * 57.29578f);
+}
+
+static void updateMotionEstimate(float dt) {
+  if (dt <= 0.0f) return;
+  gMotionDtMs = dt * 1000.0f;
+
+  const float q0 = gQuat0;
+  const float q1 = gQuat1;
+  const float q2 = gQuat2;
+  const float q3 = gQuat3;
+
+  const float gravX = 2.0f * (q1 * q3 - q0 * q2);
+  const float gravY = 2.0f * (q0 * q1 + q2 * q3);
+  const float gravZ = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+
+  gGravityX = gravX;
+  gGravityY = gravY;
+  gGravityZ = gravZ;
+
+  const float linBodyX = gAccelX - gravX;
+  const float linBodyY = gAccelY - gravY;
+  const float linBodyZ = gAccelZ - gravZ;
+
+  const float r00 = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
+  const float r01 = 2.0f * (q1 * q2 - q0 * q3);
+  const float r02 = 2.0f * (q1 * q3 + q0 * q2);
+  const float r10 = 2.0f * (q1 * q2 + q0 * q3);
+  const float r11 = 1.0f - 2.0f * (q1 * q1 + q3 * q3);
+  const float r12 = 2.0f * (q2 * q3 - q0 * q1);
+  const float r20 = 2.0f * (q1 * q3 - q0 * q2);
+  const float r21 = 2.0f * (q2 * q3 + q0 * q1);
+  const float r22 = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
+
+  const float worldLinGx = r00 * linBodyX + r01 * linBodyY + r02 * linBodyZ;
+  const float worldLinGy = r10 * linBodyX + r11 * linBodyY + r12 * linBodyZ;
+  const float worldLinGz = r20 * linBodyX + r21 * linBodyY + r22 * linBodyZ;
+
+  constexpr float G_TO_MPS2 = 9.80665f;
+  gLinAccX = worldLinGx * G_TO_MPS2;
+  gLinAccY = worldLinGy * G_TO_MPS2;
+  gLinAccZ = worldLinGz * G_TO_MPS2;
+
+  const float accMagG = sqrtf(worldLinGx * worldLinGx + worldLinGy * worldLinGy + worldLinGz * worldLinGz);
+  const bool nearlyStill = accMagG < 0.08f && gGyroAbs < 2.5f;
+
+  if (!gMotionSeeded) {
+    gMotionSeeded = true;
+    gVelX = 0.0f;
+    gVelY = 0.0f;
+    gVelZ = 0.0f;
+    gPosX = 0.0f;
+    gPosY = 0.0f;
+    gPosZ = 0.0f;
+  }
+
+  if (nearlyStill) {
+    if (gMotionStillCount < 255) gMotionStillCount++;
+  } else {
+    gMotionStillCount = 0;
+  }
+
+  if (gMotionStillCount >= 8) {
+    gVelX *= 0.20f;
+    gVelY *= 0.20f;
+    gVelZ *= 0.20f;
+  } else {
+    gVelX = (gVelX + gLinAccX * dt) * 0.995f;
+    gVelY = (gVelY + gLinAccY * dt) * 0.995f;
+    gVelZ = (gVelZ + gLinAccZ * dt) * 0.995f;
+
+    gPosX += gVelX * dt;
+    gPosY += gVelY * dt;
+    gPosZ += gVelZ * dt;
+  }
+
+  if (!isfinite(gPosX)) gPosX = 0.0f;
+  if (!isfinite(gPosY)) gPosY = 0.0f;
+  if (!isfinite(gPosZ)) gPosZ = 0.0f;
+}
+
 static float kalmanUpdateAxis(KalmanAxis& k, float measuredAngle, float measuredRate, float dt) {
   float rate = measuredRate - k.bias;
   k.angle += dt * rate;
@@ -442,45 +585,130 @@ static float kalmanUpdateAxis(KalmanAxis& k, float measuredAngle, float measured
 }
 
 static void updateOrientationFusion(float dt, float gx, float gy, float gz, float ax, float ay, float az) {
+  const float DEG_TO_RAD_F = 0.0174532925f;
+  float wx = gx * DEG_TO_RAD_F;
+  float wy = gy * DEG_TO_RAD_F;
+  float wz = gz * DEG_TO_RAD_F;
+
   float accNorm = sqrtf(ax * ax + ay * ay + az * az);
   bool accelValid = accNorm > 0.3f;
 
+  float q0 = gQuat0;
+  float q1 = gQuat1;
+  float q2 = gQuat2;
+  float q3 = gQuat3;
+
   if (!gFusionSeeded) {
     if (accelValid) {
-      gRoll = atan2f(ay, az) * 57.29578f;
-      gPitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.29578f;
-      gKalRoll.angle = gRoll;
-      gKalPitch.angle = gPitch;
+      float invAcc = 1.0f / accNorm;
+      float axn = ax * invAcc;
+      float ayn = ay * invAcc;
+      float azn = az * invAcc;
+
+      gRoll = atan2f(ayn, azn) * 57.29578f;
+      gPitch = atan2f(-axn, sqrtf(ayn * ayn + azn * azn)) * 57.29578f;
+
+      const float hr = gRoll * 0.00872664626f;
+      const float hp = gPitch * 0.00872664626f;
+      const float hy = 0.0f;
+      const float cr = cosf(hr);
+      const float sr = sinf(hr);
+      const float cp = cosf(hp);
+      const float sp = sinf(hp);
+      const float cy = cosf(hy);
+      const float sy = sinf(hy);
+      q0 = cr * cp * cy + sr * sp * sy;
+      q1 = sr * cp * cy - cr * sp * sy;
+      q2 = cr * sp * cy + sr * cp * sy;
+      q3 = cr * cp * sy - sr * sp * cy;
     }
     gFusionSeeded = true;
   }
 
   if (accelValid) {
-    float rollAcc = atan2f(ay, az) * 57.29578f;
-    float pitchAcc = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.29578f;
-    gRoll = kalmanUpdateAxis(gKalRoll, rollAcc, gx, dt);
-    gPitch = kalmanUpdateAxis(gKalPitch, pitchAcc, gy, dt);
-  } else {
-    gRoll += gx * dt;
-    gPitch += gy * dt;
+    float invAcc = 1.0f / accNorm;
+    float axn = ax * invAcc;
+    float ayn = ay * invAcc;
+    float azn = az * invAcc;
+
+    float gravX = 2.0f * (q1 * q3 - q0 * q2);
+    float gravY = 2.0f * (q0 * q1 + q2 * q3);
+    float gravZ = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+
+    // Quaternion-first correction using gravity alignment error.
+    float ex = (ayn * gravZ - azn * gravY);
+    float ey = (azn * gravX - axn * gravZ);
+    float ez = (axn * gravY - ayn * gravX);
+    wx += QUAT_ACC_GAIN * ex;
+    wy += QUAT_ACC_GAIN * ey;
+    wz += QUAT_ACC_GAIN * ez;
   }
 
-  gYaw = normalize360(gYaw + gz * dt);
+  // Integrate quaternion using corrected angular rate.
+  float dq0 = 0.5f * (-q1 * wx - q2 * wy - q3 * wz);
+  float dq1 = 0.5f * ( q0 * wx + q2 * wz - q3 * wy);
+  float dq2 = 0.5f * ( q0 * wy - q1 * wz + q3 * wx);
+  float dq3 = 0.5f * ( q0 * wz + q1 * wy - q2 * wx);
+
+  q0 += dq0 * dt;
+  q1 += dq1 * dt;
+  q2 += dq2 * dt;
+  q3 += dq3 * dt;
+
+  float qNorm = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  if (qNorm > 1e-6f) {
+    q0 /= qNorm;
+    q1 /= qNorm;
+    q2 /= qNorm;
+    q3 /= qNorm;
+  } else {
+    q0 = 1.0f;
+    q1 = 0.0f;
+    q2 = 0.0f;
+    q3 = 0.0f;
+  }
+
+  gQuat0 = q0;
+  gQuat1 = q1;
+  gQuat2 = q2;
+  gQuat3 = q3;
+
+  updateEulerFromQuaternion();
 
   if (gHasMag) {
-    float rollRad = gRoll * 0.0174532925f;
-    float pitchRad = gPitch * 0.0174532925f;
-    float mx = gMagX;
-    float my = gMagY;
-    float mz = gMagZ;
-
-    float mxComp = mx * cosf(pitchRad) + mz * sinf(pitchRad);
-    float myComp = mx * sinf(rollRad) * sinf(pitchRad) + my * cosf(rollRad) - mz * sinf(rollRad) * cosf(pitchRad);
-    float heading = atan2f(myComp, mxComp) * 57.29578f;
-    gHeading = normalize360(heading);
+    float rollRad = gRoll * DEG_TO_RAD_F;
+    float pitchRad = gPitch * DEG_TO_RAD_F;
+    float mxComp = gMagX * cosf(pitchRad) + gMagZ * sinf(pitchRad);
+    float myComp = gMagX * sinf(rollRad) * sinf(pitchRad) + gMagY * cosf(rollRad) - gMagZ * sinf(rollRad) * cosf(pitchRad);
+    gHeading = normalize360(atan2f(myComp, mxComp) * 57.29578f);
 
     float yawErr = wrapAngle180(gHeading - gYaw);
-    gYaw = normalize360(gYaw + YAW_MAG_BLEND * yawErr);
+    float absRate = sqrtf(gx * gx + gy * gy + gz * gz);
+    float dynamicBlend = YAW_MAG_BLEND_MAX;
+    if (absRate > 220.0f) {
+      dynamicBlend = YAW_MAG_BLEND_MIN;
+    } else if (absRate > 0.0f) {
+      float t = absRate / 220.0f;
+      dynamicBlend = YAW_MAG_BLEND_MAX - (YAW_MAG_BLEND_MAX - YAW_MAG_BLEND_MIN) * t;
+    }
+    float yawCorr = (dynamicBlend + QUAT_MAG_GAIN * 0.01f) * yawErr;
+
+    float halfYaw = 0.5f * yawCorr * DEG_TO_RAD_F;
+    float cq = cosf(halfYaw);
+    float sq = sinf(halfYaw);
+    float nq0 = q0 * cq - q3 * sq;
+    float nq1 = q1 * cq - q2 * sq;
+    float nq2 = q2 * cq + q1 * sq;
+    float nq3 = q3 * cq + q0 * sq;
+
+    float nNorm = sqrtf(nq0 * nq0 + nq1 * nq1 + nq2 * nq2 + nq3 * nq3);
+    if (nNorm > 1e-6f) {
+      gQuat0 = nq0 / nNorm;
+      gQuat1 = nq1 / nNorm;
+      gQuat2 = nq2 / nNorm;
+      gQuat3 = nq3 / nNorm;
+      updateEulerFromQuaternion();
+    }
   } else {
     gHeading = gYaw;
   }
@@ -735,12 +963,33 @@ static void cpuStressTask(void* parm) {
   }
 }
 
+static void onImuWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  (void)payload;
+  (void)length;
+  switch (type) {
+    case WStype_CONNECTED:
+      gImuWsClientCount = imuWs.connectedClients();
+      Serial.printf("[IMU-WS] Client %u connected (%u total)\n", num, gImuWsClientCount);
+      break;
+    case WStype_DISCONNECTED:
+      gImuWsClientCount = imuWs.connectedClients();
+      Serial.printf("[IMU-WS] Client %u disconnected (%u total)\n", num, gImuWsClientCount);
+      break;
+    default:
+      break;
+  }
+}
+
 // ================================================================
 // ISRs (buttons only — sensor read uses millis() for portability)
 // ================================================================
 void IRAM_ATTR isrBtnNext() { isrNextFlag = true; }
 void IRAM_ATTR isrBtnPrev() { isrPrevFlag = true; }
-void IRAM_ATTR isrGyroDataReady() { gyroDataReadyFlag = true; }  // MPU data ready interrupt
+void IRAM_ATTR isrGyroDataReady() {
+  if (gyroDataReadyCount < 1000) {
+    gyroDataReadyCount++;
+  }
+}  // MPU data ready interrupt
 
 // ================================================================
 // THERMISTOR — ADC TO TEMPERATURE (Direct B-parameter calculation)
@@ -964,6 +1213,32 @@ static bool initGyro() {
 
   if (mpuAddr != 0) {
     if (who == MPU_WHO_AM_I_6500 || who == MPU_WHO_AM_I_9250) {
+#if USE_MPU_DMP
+      // DMP-first path based on provided MPU example.
+      if (mpu.begin() == INV_SUCCESS) {
+        mpu.enableInterrupt();
+        mpu.setIntLevel(INT_ACTIVE_LOW);
+        mpu.setIntLatched(INT_LATCHED);
+
+        if (mpu.dmpBegin(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_GYRO_CAL, 10) == INV_SUCCESS) {
+          mpu.dmpSetOrientation(orientationDefault);
+          gImuAddr = mpuAddr;
+          gImuIsMpu = true;
+          gMpuDmpActive = true;
+          gHasMag = false;
+          gGyroFilterSeeded = false;
+          gFusionSeeded = false;
+          gLastFusionUs = 0;
+          gQuat0 = 1.0f;
+          gQuat1 = 0.0f;
+          gQuat2 = 0.0f;
+          gQuat3 = 0.0f;
+          return true;
+        }
+      }
+#endif
+
+      // Safe fallback: existing register-based path.
       if (!i2cWriteReg(mpuAddr, MPU_PWR_MGMT_1, 0x01)) return false;  // wake up + auto clock source
       if (!i2cWriteReg(mpuAddr, MPU_PWR_MGMT_2, 0x00)) return false;  // enable all accel/gyro axes
       delay(20);
@@ -1006,6 +1281,7 @@ static bool initGyro() {
 
       gImuAddr = mpuAddr;
       gImuIsMpu = true;
+      gMpuDmpActive = false;
       gGyroFilterSeeded = false;
       gFusionSeeded = false;
       gLastFusionUs = 0;
@@ -1054,6 +1330,52 @@ static bool readGyro() {
   if (gImuAddr == 0) return false;
 
   if (gImuIsMpu) {
+    if (gMpuDmpActive) {
+      unsigned short fifoCnt = mpu.fifoAvailable();
+      if (fifoCnt == 0) return false;
+
+      inv_error_t result = mpu.dmpUpdateFifo();
+      if (result != INV_SUCCESS) return false;
+
+      mpu.computeEulerAngles();
+
+      gQuat0 = mpu.calcQuat(mpu.qw);
+      gQuat1 = mpu.calcQuat(mpu.qx);
+      gQuat2 = mpu.calcQuat(mpu.qy);
+      gQuat3 = mpu.calcQuat(mpu.qz);
+
+      gGyroRawX = mpu.gx;
+      gGyroRawY = mpu.gy;
+      gGyroRawZ = mpu.gz;
+      gAccelRawX = mpu.ax;
+      gAccelRawY = mpu.ay;
+      gAccelRawZ = mpu.az;
+
+      gGyroX = mpu.calcGyro(mpu.gx);
+      gGyroY = mpu.calcGyro(mpu.gy);
+      gGyroZ = mpu.calcGyro(mpu.gz);
+      gAccelX = mpu.calcAccel(mpu.ax);
+      gAccelY = mpu.calcAccel(mpu.ay);
+      gAccelZ = mpu.calcAccel(mpu.az);
+
+      gRoll = mpu.roll;
+      gPitch = mpu.pitch;
+      gYaw = normalize360(mpu.yaw);
+      gHeading = gYaw;
+      gGyroAbs = sqrtf(gGyroX * gGyroX + gGyroY * gGyroY + gGyroZ * gGyroZ);
+
+      uint32_t nowUs = micros();
+      float dt = 0.01f;
+      if (gLastMotionUs != 0) {
+        dt = (nowUs - gLastMotionUs) * 1e-6f;
+        if (dt < 0.001f) dt = 0.001f;
+        if (dt > 0.05f) dt = 0.05f;
+      }
+      gLastMotionUs = nowUs;
+      updateMotionEstimate(dt);
+      return true;
+    }
+
     uint8_t buf[14] = {0};
     if (!i2cReadRegs(gImuAddr, MPU_ACCEL_XOUT_H, buf, sizeof(buf))) return false;
 
@@ -1119,6 +1441,16 @@ static bool readGyro() {
     }
     gLastFusionUs = nowUs;
     updateOrientationFusion(dt, gx, gy, gz, gAccelX, gAccelY, gAccelZ);
+
+    uint32_t motionNowUs = micros();
+    float motionDt = 0.01f;
+    if (gLastMotionUs != 0) {
+      motionDt = (motionNowUs - gLastMotionUs) * 1e-6f;
+      if (motionDt < 0.001f) motionDt = 0.001f;
+      if (motionDt > 0.05f) motionDt = 0.05f;
+    }
+    gLastMotionUs = motionNowUs;
+    updateMotionEstimate(motionDt);
   } else {
     uint8_t buf[6] = {0};
     if (!i2cReadRegs(gImuAddr, (uint8_t)(LSM_OUTX_L_G | 0x80), buf, sizeof(buf))) {
@@ -1144,6 +1476,16 @@ static bool readGyro() {
     }
     gLastFusionUs = nowUs;
     updateOrientationFusion(dt, gGyroX, gGyroY, gGyroZ, 0.0f, 0.0f, 0.0f);
+
+    uint32_t motionNowUs = micros();
+    float motionDt = 0.01f;
+    if (gLastMotionUs != 0) {
+      motionDt = (motionNowUs - gLastMotionUs) * 1e-6f;
+      if (motionDt < 0.001f) motionDt = 0.001f;
+      if (motionDt > 0.05f) motionDt = 0.05f;
+    }
+    gLastMotionUs = motionNowUs;
+    updateMotionEstimate(motionDt);
   }
 
   gGyroAbs = sqrtf(gGyroX * gGyroX + gGyroY * gGyroY + gGyroZ * gGyroZ);
@@ -1622,6 +1964,10 @@ static size_t buildJSON(char* buf, size_t bufSize) {
     doc["pitch"] = roundf(gPitch * 100.0f) / 100.0f;
     doc["yaw"] = roundf(gYaw * 100.0f) / 100.0f;
     doc["heading"] = roundf(gHeading * 100.0f) / 100.0f;
+    doc["q0"] = roundf(gQuat0 * 10000.0f) / 10000.0f;
+    doc["q1"] = roundf(gQuat1 * 10000.0f) / 10000.0f;
+    doc["q2"] = roundf(gQuat2 * 10000.0f) / 10000.0f;
+    doc["q3"] = roundf(gQuat3 * 10000.0f) / 10000.0f;
     if (gHasMag) {
       doc["mx"] = roundf(gMagX * 10.0f) / 10.0f;
       doc["my"] = roundf(gMagY * 10.0f) / 10.0f;
@@ -1645,6 +1991,10 @@ static size_t buildJSON(char* buf, size_t bufSize) {
     doc["pitch"] = nullptr;
     doc["yaw"] = nullptr;
     doc["heading"] = nullptr;
+    doc["q0"] = nullptr;
+    doc["q1"] = nullptr;
+    doc["q2"] = nullptr;
+    doc["q3"] = nullptr;
     doc["mx"] = nullptr;
     doc["my"] = nullptr;
     doc["mz"] = nullptr;
@@ -1676,6 +2026,58 @@ static size_t buildJSON(char* buf, size_t bufSize) {
   doc["mac"]    = WiFi.macAddress();
   doc["channel"] = (int)WiFi.channel();
 
+  return serializeJson(doc, buf, bufSize);
+}
+
+static size_t buildImuJSON(char* buf, size_t bufSize) {
+  JsonDocument doc;
+  float q0 = isfinite(gQuat0) ? gQuat0 : 1.0f;
+  float q1 = isfinite(gQuat1) ? gQuat1 : 0.0f;
+  float q2 = isfinite(gQuat2) ? gQuat2 : 0.0f;
+  float q3 = isfinite(gQuat3) ? gQuat3 : 0.0f;
+
+  float qn = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  if (qn > 1e-6f) {
+    q0 /= qn;
+    q1 /= qn;
+    q2 /= qn;
+    q3 /= qn;
+  } else {
+    q0 = 1.0f;
+    q1 = 0.0f;
+    q2 = 0.0f;
+    q3 = 0.0f;
+  }
+
+  doc["up"] = gUptime;
+  doc["q0"] = roundf(q0 * 10000.0f) / 10000.0f;
+  doc["q1"] = roundf(q1 * 10000.0f) / 10000.0f;
+  doc["q2"] = roundf(q2 * 10000.0f) / 10000.0f;
+  doc["q3"] = roundf(q3 * 10000.0f) / 10000.0f;
+  doc["roll"] = roundf(gRoll * 100.0f) / 100.0f;
+  doc["pitch"] = roundf(gPitch * 100.0f) / 100.0f;
+  doc["yaw"] = roundf(gYaw * 100.0f) / 100.0f;
+  doc["gx"] = roundf(gGyroX * 10.0f) / 10.0f;
+  doc["gy"] = roundf(gGyroY * 10.0f) / 10.0f;
+  doc["gz"] = roundf(gGyroZ * 10.0f) / 10.0f;
+
+  // Optional relative motion fields (can drift, use for visual effect only).
+  doc["lin_ax"] = roundf(gLinAccX * 1000.0f) / 1000.0f;
+  doc["lin_ay"] = roundf(gLinAccY * 1000.0f) / 1000.0f;
+  doc["lin_az"] = roundf(gLinAccZ * 1000.0f) / 1000.0f;
+  doc["vel_x"] = roundf(gVelX * 1000.0f) / 1000.0f;
+  doc["vel_y"] = roundf(gVelY * 1000.0f) / 1000.0f;
+  doc["vel_z"] = roundf(gVelZ * 1000.0f) / 1000.0f;
+  doc["pos_x"] = roundf(gPosX * 1000.0f) / 1000.0f;
+  doc["pos_y"] = roundf(gPosY * 1000.0f) / 1000.0f;
+  doc["pos_z"] = roundf(gPosZ * 1000.0f) / 1000.0f;
+  doc["dt_ms"] = roundf(gMotionDtMs * 100.0f) / 100.0f;
+  doc["stationary"] = (gMotionStillCount >= 8);
+  doc["mode"] = gMpuDmpActive ? "mpu_dmp" : "fusion";
+  doc["frame"] = "right-handed";
+  doc["axes"] = "x:right,y:forward,z:up";
+  doc["angles"] = "degrees";
+  doc["quat_order"] = "wxyz";
   return serializeJson(doc, buf, bufSize);
 }
 
@@ -1727,11 +2129,19 @@ static size_t buildRawGpioJSON(char* buf, size_t bufSize) {
     orient["pitch"] = roundf(gPitch * 100.0f) / 100.0f;
     orient["yaw"] = roundf(gYaw * 100.0f) / 100.0f;
     orient["heading"] = roundf(gHeading * 100.0f) / 100.0f;
+    orient["q0"] = roundf(gQuat0 * 10000.0f) / 10000.0f;
+    orient["q1"] = roundf(gQuat1 * 10000.0f) / 10000.0f;
+    orient["q2"] = roundf(gQuat2 * 10000.0f) / 10000.0f;
+    orient["q3"] = roundf(gQuat3 * 10000.0f) / 10000.0f;
   } else {
     orient["roll"] = nullptr;
     orient["pitch"] = nullptr;
     orient["yaw"] = nullptr;
     orient["heading"] = nullptr;
+    orient["q0"] = nullptr;
+    orient["q1"] = nullptr;
+    orient["q2"] = nullptr;
+    orient["q3"] = nullptr;
   }
 
   JsonObject magRaw = doc["mag_raw"].to<JsonObject>();
@@ -2299,8 +2709,10 @@ void setup() {
     Serial.printf(" @0x%02X %s\n", gImuAddr, gImuIsMpu ? "(MPU6500/9250)" : "(LSM6DS3)");
     // Attach interrupt for data-ready if MPU is present
     if (gImuIsMpu) {
-      attachInterrupt(digitalPinToInterrupt(GYRO_INT), isrGyroDataReady, RISING);
+      attachInterrupt(digitalPinToInterrupt(GYRO_INT), isrGyroDataReady,
+                      gMpuDmpActive ? FALLING : RISING);
       Serial.printf("[GYRO-INT] Attached to GPIO%u (data ready interrupt)\n", GYRO_INT);
+      Serial.printf("[GYRO]   MPU mode: %s\n", gMpuDmpActive ? "DMP quaternion" : "register fusion");
     }
     Serial.printf("[MAG]    %s\n", gHasMag ? "AK8963 detected" : "Not present");
   } else {
@@ -2339,11 +2751,16 @@ void setup() {
 
   loadBatteryState();
 
+  imuWs.begin();
+  imuWs.onEvent(onImuWebSocketEvent);
+  Serial.printf("[IMU-WS] Listening on ws://%s:%u\n", WiFi.localIP().toString().c_str(), IMU_WS_PORT);
+
   for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
     gGpioLastState[i] = -1;
   }
 
   lastOtherSensorRead = millis();
+  lastImuPublishMs = millis();
   lastEnergy = millis();
   gLastBattPersistMs = millis();
 
@@ -2357,6 +2774,8 @@ void setup() {
 // ================================================================
 void loop() {
   updateConnectivityMode();
+
+  imuWs.loop();
 
   if (gLocalBrokerStarted) {
     localBroker.update();
@@ -2375,10 +2794,17 @@ void loop() {
   // Buttons (ISR-driven, just check flags)
   handleButtons();
 
-  // FAST: Gyroscope via interrupt (200Hz hardware rate, processed on data ready flag)
-  if (gyroDataReadyFlag) {
-    gyroDataReadyFlag = false;
-    if (hasGyro && moduleGyro) {
+  // FAST: Gyroscope via interrupt (GPIO10 INT pin), drain a few queued events per loop.
+  if (hasGyro && moduleGyro) {
+    uint16_t pending = 0;
+    noInterrupts();
+    pending = gyroDataReadyCount;
+    gyroDataReadyCount = 0;
+    interrupts();
+
+    if (pending > 3) pending = 3;  // avoid starving the rest of the loop
+
+    while (pending--) {
       (void)readGyro();  // Fast, non-blocking gyro read only
       gLastGyroReadMs = millis();
     }
@@ -2388,6 +2814,19 @@ void loop() {
   if (hasGyro && moduleGyro && (millis() - gLastGyroReadMs >= 20)) {
     (void)readGyro();
     gLastGyroReadMs = millis();
+  }
+
+  // FAST IMU publish for frontend rendering.
+  if (hasGyro && moduleGyro && (millis() - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
+    lastImuPublishMs = millis();
+
+    char imuJson[768];
+    size_t imuLen = buildImuJSON(imuJson, sizeof(imuJson));
+    if (imuLen > 0 && imuLen < sizeof(imuJson)) {
+      imuWs.broadcastTXT(imuJson);
+    } else {
+      Serial.println("[IMU-WS] Payload too large or empty");
+    }
   }
 
   // SLOW: Other sensors (1Hz) + MQTT publish
