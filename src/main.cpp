@@ -104,6 +104,7 @@ static const char* MQTT_STATE_TOPIC = "hardandsoft/esp32/state";
 static const char* MQTT_USER        = "emqx";
 static const char* MQTT_PASS_MQTT   = "public";
 static const uint32_t IMU_PUBLISH_INTERVAL_MS = 16;  // ~60Hz for smoother VR rendering
+static const uint32_t IMU_PUBLISH_IDLE_INTERVAL_MS = 50;  // Lower background cost when no WS client is connected
 static const uint16_t IMU_WS_PORT = 8001;
 
 // ================================================================
@@ -189,10 +190,18 @@ static const float LSM_GYRO_SCALE_DPS = 0.07f;         // LSM6DS3 @ +-2000 dps
 static const float MPU_ACCEL_SCALE_G = 1.0f / 16384.0f; // MPU @ +-2g
 static const uint8_t MPU_BIAS_SAMPLES = 96;
 static const float GYRO_FILTER_ALPHA = 0.25f;  // REDUCED: 0.70→0.25 for faster real-time response (was causing 2-3s lag)
-static const float MPU_BIAS_TRACK_ALPHA = 0.015f;  // Slightly reduced for stability during faster updates
 static const float GYRO_DEADBAND_DPS = 0.5f;  // TIGHTENED: 1.2→0.5 for better precision
 static const float GYRO_STILL_DPS = 2.5f;
 static const uint8_t GYRO_STILL_REQUIRED_SAMPLES = 6;
+static const uint8_t ZUPT_STILL_REQUIRED_SAMPLES = 10;
+static const uint32_t BIAS_RECAL_INTERVAL_MS = 300000;
+static const float GYRO_BIAS_STILL_ALPHA = 0.015f;
+static const float GYRO_BIAS_RECAL_ALPHA = 0.06f;
+static const float ACCEL_BIAS_STILL_ALPHA = 0.01f;
+static const float ACCEL_BIAS_RECAL_ALPHA = 0.04f;
+static const float ZUPT_VEL_DECAY = 0.02f;
+static const float ZUPT_POS_HOLD_ALPHA = 0.002f;
+static const float STATIONARY_WORLD_ACC_G = 0.08f;
 
 // Kalman orientation fusion constants (gyro + accel) and yaw correction with mag.
 static const float KALMAN_Q_ANGLE = 0.001f;
@@ -208,7 +217,7 @@ static const uint8_t OLED_TITLE_TEXT_Y = 4;
 static const signed char orientationDefault[9] = {0, 1, 0, 0, 0, 1, 1, 0, 0};
 // SparkFun DMP path can hang on some ESP32-C3 + MPU setups during boot.
 // Keep fallback to register fusion if DMP init fails.
-#define USE_MPU_DMP 1
+#define USE_MPU_DMP 0
 
 // ================================================================
 // DISPLAY & TIMING
@@ -262,7 +271,11 @@ static float    gGyroAbs    = 0.0f;
 static float    gGyroBiasX  = 0.0f;
 static float    gGyroBiasY  = 0.0f;
 static float    gGyroBiasZ  = 0.0f;
+static float    gAccelBiasX  = 0.0f;
+static float    gAccelBiasY  = 0.0f;
+static float    gAccelBiasZ  = 0.0f;
 static bool     gGyroFilterSeeded = false;
+static bool     gAccelBiasSeeded = false;
 static uint8_t  gGyroStillCount = 0;
 static float    gAccelX     = 0.0f;
 static float    gAccelY     = 0.0f;
@@ -300,6 +313,11 @@ static uint32_t gLastMotionUs = 0;
 static uint8_t  gMotionStillCount = 0;
 static bool     gMotionSeeded = false;
 static float    gMotionDtMs = 0.0f;
+static uint32_t gLastBiasUpdateMs = 0;
+static bool     gMotionAnchorValid = false;
+static float    gMotionAnchorX = 0.0f;
+static float    gMotionAnchorY = 0.0f;
+static float    gMotionAnchorZ = 0.0f;
 static uint32_t gLastMagReadMs = 0;
 static float    gMagAdjX    = 1.0f;
 static float    gMagAdjY    = 1.0f;
@@ -330,7 +348,9 @@ static uint32_t lastEnergy  = 0;
 // CPU load tracking
 static volatile uint32_t cpuIdleHookCount = 0;
 static uint32_t cpuLastIdleHookCount = 0;
-static float cpuIdleHookBaseline = 0.0f;
+static uint32_t cpuLastLoadSampleMs = 0;
+static uint32_t cpuPrevIdleHookCount = 0;
+static float cpuIdleRateRef = 0.0f;
 static uint32_t cpuPrevTotalRunTime = 0;
 static uint32_t cpuPrevIdleRunTime = 0;
 static bool cpuRuntimeSeeded = false;
@@ -520,7 +540,7 @@ static void updateMotionEstimate(float dt) {
   gLinAccZ = worldLinGz * G_TO_MPS2;
 
   const float accMagG = sqrtf(worldLinGx * worldLinGx + worldLinGy * worldLinGy + worldLinGz * worldLinGz);
-  const bool nearlyStill = accMagG < 0.08f && gGyroAbs < 2.5f;
+  const bool nearlyStill = accMagG < STATIONARY_WORLD_ACC_G && gGyroAbs < GYRO_STILL_DPS;
 
   if (!gMotionSeeded) {
     gMotionSeeded = true;
@@ -538,11 +558,25 @@ static void updateMotionEstimate(float dt) {
     gMotionStillCount = 0;
   }
 
-  if (gMotionStillCount >= 8) {
-    gVelX *= 0.20f;
-    gVelY *= 0.20f;
-    gVelZ *= 0.20f;
+  const bool zuptActive = (gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES);
+
+  if (zuptActive) {
+    if (!gMotionAnchorValid) {
+      gMotionAnchorX = gPosX;
+      gMotionAnchorY = gPosY;
+      gMotionAnchorZ = gPosZ;
+      gMotionAnchorValid = true;
+    }
+
+    gVelX = 0.0f;
+    gVelY = 0.0f;
+    gVelZ = 0.0f;
+
+    gPosX = gPosX * (1.0f - ZUPT_POS_HOLD_ALPHA) + gMotionAnchorX * ZUPT_POS_HOLD_ALPHA;
+    gPosY = gPosY * (1.0f - ZUPT_POS_HOLD_ALPHA) + gMotionAnchorY * ZUPT_POS_HOLD_ALPHA;
+    gPosZ = gPosZ * (1.0f - ZUPT_POS_HOLD_ALPHA) + gMotionAnchorZ * ZUPT_POS_HOLD_ALPHA;
   } else {
+    gMotionAnchorValid = false;
     gVelX = (gVelX + gLinAccX * dt) * 0.995f;
     gVelY = (gVelY + gLinAccY * dt) * 0.995f;
     gVelZ = (gVelZ + gLinAccZ * dt) * 0.995f;
@@ -555,6 +589,32 @@ static void updateMotionEstimate(float dt) {
   if (!isfinite(gPosX)) gPosX = 0.0f;
   if (!isfinite(gPosY)) gPosY = 0.0f;
   if (!isfinite(gPosZ)) gPosZ = 0.0f;
+}
+
+static void updateInertialBiases(bool stationary, float axMeas, float ayMeas, float azMeas, float gxRate, float gyRate, float gzRate) {
+  uint32_t nowMs = millis();
+  if (!stationary) return;
+  if (gLastBiasUpdateMs != 0 && nowMs - gLastBiasUpdateMs < BIAS_RECAL_INTERVAL_MS) return;
+
+  gLastBiasUpdateMs = nowMs;
+
+  float gyroAlpha = (gMotionStillCount >= (ZUPT_STILL_REQUIRED_SAMPLES * 2)) ? GYRO_BIAS_RECAL_ALPHA : GYRO_BIAS_STILL_ALPHA;
+  float accelAlpha = (gMotionStillCount >= (ZUPT_STILL_REQUIRED_SAMPLES * 2)) ? ACCEL_BIAS_RECAL_ALPHA : ACCEL_BIAS_STILL_ALPHA;
+
+  if (!gAccelBiasSeeded) {
+    gAccelBiasX = axMeas - gGravityX;
+    gAccelBiasY = ayMeas - gGravityY;
+    gAccelBiasZ = azMeas - gGravityZ;
+    gAccelBiasSeeded = true;
+  } else {
+    gGyroBiasX += gyroAlpha * (gxRate - gGyroBiasX);
+    gGyroBiasY += gyroAlpha * (gyRate - gGyroBiasY);
+    gGyroBiasZ += gyroAlpha * (gzRate - gGyroBiasZ);
+
+    gAccelBiasX += accelAlpha * ((axMeas - gGravityX) - gAccelBiasX);
+    gAccelBiasY += accelAlpha * ((ayMeas - gGravityY) - gAccelBiasY);
+    gAccelBiasZ += accelAlpha * ((azMeas - gGravityZ) - gAccelBiasZ);
+  }
 }
 
 static float kalmanUpdateAxis(KalmanAxis& k, float measuredAngle, float measuredRate, float dt) {
@@ -855,26 +915,75 @@ static float ocvToSocPct(float v) {
 }
 
 static float measureCpuLoadPct() {
-  float nativeLoad = 0.0f;
-  float rawLoad = 0.0f;
-  if (getCpuLoadFromRuntimeStats(nativeLoad)) {
-    rawLoad = nativeLoad;
-  } else {
-    // Fallback when runtime stats are not available in this build.
-    rawLoad = getCpuLoadFromIdleHook();
+  static bool cpuLoadFilteredSeeded = false;
+  static float cpuLoadFiltered = 0.0f;
+
+  uint32_t nowMs = millis();
+  if (cpuLastLoadSampleMs == 0) {
+    cpuLastLoadSampleMs = nowMs;
+    cpuPrevIdleHookCount = cpuIdleHookCount;
   }
 
-  static bool seeded = false;
-  static float filteredLoad = 0.0f;
-  if (!seeded) {
-    filteredLoad = rawLoad;
-    seeded = true;
-  } else {
-    filteredLoad += 0.20f * (rawLoad - filteredLoad);
+  uint32_t elapsedMs = nowMs - cpuLastLoadSampleMs;
+  if (elapsedMs < 1000U) {
+    return gCpuLoad;
   }
 
-  if (filteredLoad < 0.2f) filteredLoad = 0.0f;
-  return constrain(filteredLoad, 0.0f, 100.0f);
+  float loadOut = 0.0f;
+  bool measured = false;
+  if (getCpuLoadFromRuntimeStats(loadOut)) {
+    measured = true;
+  } else {
+    uint32_t idleNow = cpuIdleHookCount;
+    uint32_t idleDelta = idleNow - cpuPrevIdleHookCount;
+    cpuPrevIdleHookCount = idleNow;
+
+    float idleRate = (elapsedMs > 0U) ? ((float)idleDelta / (float)elapsedMs) : 0.0f;
+
+    if (cpuIdleRateRef < 0.001f) {
+      cpuIdleRateRef = idleRate;
+      loadOut = 0.0f;
+      measured = true;
+    } else {
+      if (idleRate > cpuIdleRateRef) {
+        cpuIdleRateRef = idleRate;
+      } else {
+        // Very slow adaptation down to avoid drift from transient peaks.
+        cpuIdleRateRef = cpuIdleRateRef * 0.999f + idleRate * 0.001f;
+      }
+
+      if (cpuIdleRateRef < 0.001f) {
+        loadOut = 0.0f;
+      } else {
+        float idlePct = (100.0f * idleRate) / cpuIdleRateRef;
+        loadOut = constrain(100.0f - idlePct, 0.0f, 100.0f);
+      }
+      measured = true;
+    }
+  }
+
+  cpuLastLoadSampleMs = nowMs;
+  if (measured) {
+    float targetLoad = constrain(loadOut, 0.0f, 100.0f);
+    if (!cpuLoadFilteredSeeded) {
+      cpuLoadFiltered = targetLoad;
+      cpuLoadFilteredSeeded = true;
+    } else {
+      float alpha = (targetLoad > cpuLoadFiltered) ? 0.35f : 0.20f;
+      float next = cpuLoadFiltered + alpha * (targetLoad - cpuLoadFiltered);
+
+      // Limit abrupt 1-second jumps caused by scheduler jitter.
+      float maxStepPerSample = 3.0f;
+      float step = next - cpuLoadFiltered;
+      if (step > maxStepPerSample) step = maxStepPerSample;
+      if (step < -maxStepPerSample) step = -maxStepPerSample;
+      cpuLoadFiltered += step;
+    }
+
+    if (cpuLoadFiltered < 0.3f) cpuLoadFiltered = 0.0f;
+    return constrain(cpuLoadFiltered, 0.0f, 100.0f);
+  }
+  return gCpuLoad;
 }
 
 static bool cpuIdleHook() {
@@ -921,28 +1030,6 @@ static bool getCpuLoadFromRuntimeStats(float& loadOut) {
   (void)loadOut;
   return false;
 #endif
-}
-
-static float getCpuLoadFromIdleHook() {
-  uint32_t idleNow = cpuIdleHookCount;
-  uint32_t idleDelta = idleNow - cpuLastIdleHookCount;
-  cpuLastIdleHookCount = idleNow;
-
-  if (cpuIdleHookBaseline < 1.0f) {
-    cpuIdleHookBaseline = (float)idleDelta;
-    return 0.0f;
-  }
-
-  if ((float)idleDelta > cpuIdleHookBaseline) {
-    cpuIdleHookBaseline = (float)idleDelta;
-  } else {
-    cpuIdleHookBaseline = cpuIdleHookBaseline * 0.995f + (float)idleDelta * 0.005f;
-  }
-
-  if (cpuIdleHookBaseline < 1.0f) return 0.0f;
-
-  float idlePct = (100.0f * (float)idleDelta) / cpuIdleHookBaseline;
-  return constrain(100.0f - idlePct, 0.0f, 100.0f);
 }
 
 static void cpuStressTask(void* parm) {
@@ -1351,12 +1438,13 @@ static bool readGyro() {
       gAccelRawY = mpu.ay;
       gAccelRawZ = mpu.az;
 
+      float axMeas = mpu.calcAccel(mpu.ax);
+      float ayMeas = mpu.calcAccel(mpu.ay);
+      float azMeas = mpu.calcAccel(mpu.az);
+
       gGyroX = mpu.calcGyro(mpu.gx);
       gGyroY = mpu.calcGyro(mpu.gy);
       gGyroZ = mpu.calcGyro(mpu.gz);
-      gAccelX = mpu.calcAccel(mpu.ax);
-      gAccelY = mpu.calcAccel(mpu.ay);
-      gAccelZ = mpu.calcAccel(mpu.az);
 
       gRoll = mpu.roll;
       gPitch = mpu.pitch;
@@ -1372,7 +1460,13 @@ static bool readGyro() {
         if (dt > 0.05f) dt = 0.05f;
       }
       gLastMotionUs = nowUs;
+
+      gAccelX = axMeas - gAccelBiasX;
+      gAccelY = ayMeas - gAccelBiasY;
+      gAccelZ = azMeas - gAccelBiasZ;
+
       updateMotionEstimate(dt);
+      updateInertialBiases(gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES, axMeas, ayMeas, azMeas, gGyroX, gGyroY, gGyroZ);
       return true;
     }
 
@@ -1398,15 +1492,13 @@ static bool readGyro() {
       gGyroStillCount = 0;
     }
 
-    if (gGyroStillCount >= GYRO_STILL_REQUIRED_SAMPLES) {
-      gGyroBiasX += MPU_BIAS_TRACK_ALPHA * ((float)gGyroRawX - gGyroBiasX);
-      gGyroBiasY += MPU_BIAS_TRACK_ALPHA * ((float)gGyroRawY - gGyroBiasY);
-      gGyroBiasZ += MPU_BIAS_TRACK_ALPHA * ((float)gGyroRawZ - gGyroBiasZ);
+    float axMeas = gAccelRawX * MPU_ACCEL_SCALE_G;
+    float ayMeas = gAccelRawY * MPU_ACCEL_SCALE_G;
+    float azMeas = gAccelRawZ * MPU_ACCEL_SCALE_G;
 
-      gx = ((float)gGyroRawX - gGyroBiasX) * MPU_GYRO_SCALE_DPS;
-      gy = ((float)gGyroRawY - gGyroBiasY) * MPU_GYRO_SCALE_DPS;
-      gz = ((float)gGyroRawZ - gGyroBiasZ) * MPU_GYRO_SCALE_DPS;
-    }
+    gAccelX = axMeas - gAccelBiasX;
+    gAccelY = ayMeas - gAccelBiasY;
+    gAccelZ = azMeas - gAccelBiasZ;
 
     if (!gGyroFilterSeeded) {
       gGyroX = gx;
@@ -1418,9 +1510,6 @@ static bool readGyro() {
       gGyroY += GYRO_FILTER_ALPHA * (gy - gGyroY);
       gGyroZ += GYRO_FILTER_ALPHA * (gz - gGyroZ);
     }
-    gAccelX = gAccelRawX * MPU_ACCEL_SCALE_G;
-    gAccelY = gAccelRawY * MPU_ACCEL_SCALE_G;
-    gAccelZ = gAccelRawZ * MPU_ACCEL_SCALE_G;
 
     if (fabsf(gGyroX) < GYRO_DEADBAND_DPS) gGyroX = 0.0f;
     if (fabsf(gGyroY) < GYRO_DEADBAND_DPS) gGyroY = 0.0f;
@@ -1451,6 +1540,8 @@ static bool readGyro() {
     }
     gLastMotionUs = motionNowUs;
     updateMotionEstimate(motionDt);
+
+    updateInertialBiases(gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES, axMeas, ayMeas, azMeas, gx, gy, gz);
   } else {
     uint8_t buf[6] = {0};
     if (!i2cReadRegs(gImuAddr, (uint8_t)(LSM_OUTX_L_G | 0x80), buf, sizeof(buf))) {
@@ -2060,6 +2151,18 @@ static size_t buildImuJSON(char* buf, size_t bufSize) {
   doc["gx"] = roundf(gGyroX * 10.0f) / 10.0f;
   doc["gy"] = roundf(gGyroY * 10.0f) / 10.0f;
   doc["gz"] = roundf(gGyroZ * 10.0f) / 10.0f;
+  doc["ax"] = roundf(gAccelX * 1000.0f) / 1000.0f;
+  doc["ay"] = roundf(gAccelY * 1000.0f) / 1000.0f;
+  doc["az"] = roundf(gAccelZ * 1000.0f) / 1000.0f;
+  doc["gravity_x"] = roundf(gGravityX * 1000.0f) / 1000.0f;
+  doc["gravity_y"] = roundf(gGravityY * 1000.0f) / 1000.0f;
+  doc["gravity_z"] = roundf(gGravityZ * 1000.0f) / 1000.0f;
+  doc["gyro_bias_x"] = roundf(gGyroBiasX * 10.0f) / 10.0f;
+  doc["gyro_bias_y"] = roundf(gGyroBiasY * 10.0f) / 10.0f;
+  doc["gyro_bias_z"] = roundf(gGyroBiasZ * 10.0f) / 10.0f;
+  doc["acc_bias_x"] = roundf(gAccelBiasX * 1000.0f) / 1000.0f;
+  doc["acc_bias_y"] = roundf(gAccelBiasY * 1000.0f) / 1000.0f;
+  doc["acc_bias_z"] = roundf(gAccelBiasZ * 1000.0f) / 1000.0f;
 
   // Optional relative motion fields (can drift, use for visual effect only).
   doc["lin_ax"] = roundf(gLinAccX * 1000.0f) / 1000.0f;
@@ -2072,7 +2175,8 @@ static size_t buildImuJSON(char* buf, size_t bufSize) {
   doc["pos_y"] = roundf(gPosY * 1000.0f) / 1000.0f;
   doc["pos_z"] = roundf(gPosZ * 1000.0f) / 1000.0f;
   doc["dt_ms"] = roundf(gMotionDtMs * 100.0f) / 100.0f;
-  doc["stationary"] = (gMotionStillCount >= 8);
+  doc["stationary"] = (gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES);
+  doc["zupt"] = (gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES);
   doc["mode"] = gMpuDmpActive ? "mpu_dmp" : "fusion";
   doc["frame"] = "right-handed";
   doc["axes"] = "x:right,y:forward,z:up";
@@ -2221,7 +2325,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   const char* mod = doc["module"];
   if (!mod) return;
 
-  bool en = doc["enabled"] | true;
+  bool en = doc["enabled"] | false;
 
   if      (strcmp(mod, "temperature") == 0)  moduleTemp    = en;
   else if (strcmp(mod, "gyro") == 0)         moduleGyro    = en;
@@ -2629,7 +2733,10 @@ void setup() {
     Serial.println("[CPU] Idle hook not available, using runtime stats/0%");
   }
   cpuLastIdleHookCount = cpuIdleHookCount;
+  cpuPrevIdleHookCount = cpuIdleHookCount;
+  cpuLastLoadSampleMs = millis();
 
+  moduleCpuStress = false;
   if (xTaskCreate(cpuStressTask, "cpu_stress", 3072, nullptr, 1, nullptr) != pdPASS) {
     Serial.println("[CPU] Stress task create FAILED");
   }
@@ -2817,7 +2924,7 @@ void loop() {
   }
 
   // FAST IMU publish for frontend rendering.
-  if (hasGyro && moduleGyro && (millis() - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
+  if (hasGyro && moduleGyro && gImuWsClientCount > 0 && (millis() - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
     lastImuPublishMs = millis();
 
     char imuJson[768];
@@ -2827,6 +2934,10 @@ void loop() {
     } else {
       Serial.println("[IMU-WS] Payload too large or empty");
     }
+  }
+
+  if (hasGyro && moduleGyro && gImuWsClientCount == 0 && (millis() - lastImuPublishMs >= IMU_PUBLISH_IDLE_INTERVAL_MS)) {
+    lastImuPublishMs = millis();
   }
 
   // SLOW: Other sensors (1Hz) + MQTT publish
