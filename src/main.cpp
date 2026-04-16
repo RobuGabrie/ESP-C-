@@ -68,13 +68,14 @@ extern "C" int min(int a, int b) {
 // ================================================================
 // CONFIGURATION
 // ================================================================
-static const char* WIFI_SSIDS[] = {"stanislav", "Network", "DIGI", "DIGI-75hC"};
-static const char* WIFI_PASSWORDS[] = {"stas1524", "19911313", "27mc2004ca", "9T2Du96euz"};
+static const char* WIFI_SSIDS[] = {"stanislav", "Network", "DIGI", "DIGI-75hC", "Orange-6F26"};
+static const char* WIFI_PASSWORDS[] = {"stas1524", "19911313", "27mc2004ca", "9T2Du96euz" , "Zh3tszDsAT4FPN6hNU"};
 static const size_t WIFI_NETWORK_COUNT = std::min(
   sizeof(WIFI_SSIDS) / sizeof(WIFI_SSIDS[0]),
   sizeof(WIFI_PASSWORDS) / sizeof(WIFI_PASSWORDS[0])
 );
 static const uint8_t WIFI_ATTEMPT_TIMEOUT_SEC = 12;
+static const uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
 static const char* AP_SSID = "HS-ESP32-OFF";
 static const char* AP_PASS = "esp32hs123";
 static const uint8_t AP_CHANNEL = 6;
@@ -91,6 +92,8 @@ static const uint32_t BATT_PRESENCE_DEBOUNCE_MS = 5000;
 static const float BATT_CURRENT_DEADBAND_MA = 5.0f;
 static const char* PREF_NS = "battery";
 static const char* PREF_KEY_USED_MAH = "used_mAh";
+static const char* PREF_NS_WIFI = "wifi";
+static const char* PREF_KEY_WIFI_LAST_IDX = "last_idx";
 
 // ================================================================
 // MQTT
@@ -136,14 +139,21 @@ static const float R_FIXED   = 10000.0f;
 static const float R_NOMINAL = 10000.0f;  // 10k NTC @ 25°C
 static const float T_NOMINAL = 25.0f;
 static const float B_COEFF   = 3950.0f;   // Standard NTC B coefficient
-static const float THERM_ADC_REF_V = 3.3f;
-static const float THERM_SUPPLY_FALLBACK_V = 4.0f;
-static const float THERM_FILTER_ALPHA = 0.35f;  // Faster response, still stable enough for 1Hz reporting
+static const float THERM_ADC_REF_V = 3.3f;       // kept for open/short conversion; voltage read via analogReadMilliVolts()
+static const bool THERM_SUPPLY_IS_VBAT = false;    // Divider is powered from 3.3V rail; do not use INA/VBAT for NTC conversion
+static const float THERM_SUPPLY_FALLBACK_V = 3.3f; // used when THERM_SUPPLY_IS_VBAT=true and live VBAT is unavailable
+static const float THERM_FILTER_ALPHA = 0.18f;        // More responsive baseline smoothing
+static const float THERM_FILTER_ALPHA_FAST = 0.45f;   // Fast response for real temperature changes
+static const float THERM_FILTER_FAST_DELTA_C = 0.5f;  // Enter fast mode sooner
+static const float THERM_FILTER_DEADBAND_C = 0.02f;   // Keep small deadband only for ADC jitter
+static const uint8_t THERM_SAMPLE_COUNT = 17;         // Odd count for median selection
+static const uint16_t THERM_SAMPLE_DELAY_US = 500;    // 0.5 ms between ADC reads
+static const uint16_t THERM_TRIM_WINDOW_MV = 45;      // Keep samples close to median
 // FIXED topology - do NOT auto-detect
 // Circuit: 3.3V -> R_FIXED(10k) -> ADC -> NTC(to GND) -> GND
 static const bool THERM_NTC_TO_GND = true;
 static const float THERM_CAL_GAIN = 1.0f;
-static const float THERM_CAL_OFFSET_C = -2.0f;  // Fine tune: was reading about +6C high
+static const float THERM_CAL_OFFSET_C = -6.0f;  // One-point calibration baseline; fine-tune after stability checks
 
 // IMU support:
 // - LSM6DS3/compatible at 0x6A
@@ -399,6 +409,8 @@ static uint32_t gIgnoreButtonsUntilMs = 0;
 static bool gOfflineServicesActive = false;
 static bool gLocalBrokerStarted = false;
 static bool gWasWifiConnected = false;
+static bool gAllowWifiSkipDuringConnect = false;
+static uint32_t gLastWifiReconnectAttemptMs = 0;
 static bool gMpuDmpActive = false;
 static uint16_t gImuWsClientCount = 0;
 
@@ -464,6 +476,8 @@ static void drawOfflineQrScreen();
 static void startOfflineServices();
 static void stopOfflineServices();
 static void updateConnectivityMode();
+static int loadPreferredWifiIndex();
+static void savePreferredWifiIndex(size_t wifiIndex);
 
 static float wrapAngle180(float a) {
   while (a > 180.0f) a -= 360.0f;
@@ -1079,41 +1093,52 @@ void IRAM_ATTR isrGyroDataReady() {
 }  // MPU data ready interrupt
 
 // ================================================================
-// THERMISTOR — ADC TO TEMPERATURE (Direct B-parameter calculation)
+// THERMISTOR — ADC TO TEMPERATURE (Battery-Powered Divider)
 // ================================================================
 static float readThermistor() {
-  uint32_t sum = 0;
-  for (uint8_t i = 0; i < 8; i++) {
-    sum += (uint16_t)analogRead(THERM_PIN);
-    delayMicroseconds(250);
+  uint16_t mvSamples[THERM_SAMPLE_COUNT];
+  for (uint8_t i = 0; i < THERM_SAMPLE_COUNT; i++) {
+    mvSamples[i] = (uint16_t)analogReadMilliVolts(THERM_PIN);
+    delay(2); 
   }
 
-  gThermRaw = (uint16_t)(sum / 8U);
-  float adc = (float)gThermRaw;
+  std::sort(mvSamples, mvSamples + THERM_SAMPLE_COUNT);
+  const uint16_t medianMv = mvSamples[THERM_SAMPLE_COUNT / 2];
+
+  uint32_t sumMv = 0;
+  uint8_t kept = 0;
+  for (uint8_t i = 0; i < THERM_SAMPLE_COUNT; i++) {
+    const int32_t dMv = (int32_t)mvSamples[i] - (int32_t)medianMv;
+    if (abs(dMv) <= (int32_t)THERM_TRIM_WINDOW_MV) {
+      sumMv += mvSamples[i];
+      kept++;
+    }
+  }
+
+  const uint16_t filteredMv = (kept > 0) ? (uint16_t)(sumMv / kept) : medianMv;
+  const float vAdc = (float)filteredMv / 1000.0f;
   
-  // Check for open or short circuit conditions
-  if (adc <= 1.0f || adc >= (ADC_MAX - 1.0f)) {
+  // Update raw variable for MQTT (scaled to theoretical 3.3V max for backwards compatibility)
+  gThermRaw = (uint16_t)((uint32_t)filteredMv * 4095U / 3300U);
+
+  // =======================================================
+  // DYNAMIC VOLTAGE COMPENSATION
+  // Since the top resistor is wired to the battery, 
+  // the divider's supply voltage IS the battery voltage.
+  // =======================================================
+  float vSupply = 3.3f; // Fallback in case INA219 fails
+
+  if (hasINA219 && moduleCurrent && isfinite(gVoltage) && gVoltage > 2.0f) {
+    vSupply = gVoltage; 
+  }
+
+  // Safety check to prevent division by zero or negative resistance
+  if (vAdc <= 0.05f || vAdc >= (vSupply - 0.05f)) {
     gThermValid = false;
     return gThermFilterSeeded ? gThermFiltered : -99.0f;
   }
 
-  // Convert ADC code to node voltage.
-  const float vAdc = (adc / ADC_MAX) * THERM_ADC_REF_V;
-
-  // Use live battery voltage from INA219 (if available) because divider is powered from battery.
-  float vSupply = THERM_SUPPLY_FALLBACK_V;
-  if (hasINA219 && moduleCurrent && isfinite(gVoltage) && gVoltage > 2.5f && gVoltage < 5.5f) {
-    vSupply = gVoltage;
-  }
-
-  // For topology: Vbat -> R_FIXED -> ADC -> NTC -> GND
-  // Vadc = Vbat * Rntc / (Rfixed + Rntc)
-  // Rntc = Rfixed * Vadc / (Vbat - Vadc)
-  if (vAdc <= 0.001f || vAdc >= (vSupply - 0.001f)) {
-    gThermValid = false;
-    return gThermFilterSeeded ? gThermFiltered : -99.0f;
-  }
-
+  // Calculate NTC resistance using the live battery voltage
   float rNtc = R_FIXED * (vAdc / (vSupply - vAdc));
   
   if (!isfinite(rNtc) || rNtc < 100.0f || rNtc > 1000000.0f) {
@@ -1121,47 +1146,56 @@ static float readThermistor() {
     return gThermFilterSeeded ? gThermFiltered : -99.0f;
   }
 
-  // Calculate temperature using B-coefficient formula
-  // 1/T = (1/T0) + (1/B) * ln(R/R0)
-  // where T0=298.15K (25°C), R0=10k at 25°C, B=3950
-  
   float tempC = NAN;
   if (!thermistorTempFromResistance(rNtc, R_NOMINAL, tempC)) {
     gThermValid = false;
     return gThermFilterSeeded ? gThermFiltered : -99.0f;
   }
 
-  // Sanity check
   if (!isfinite(tempC) || tempC < -40.0f || tempC > 125.0f) {
     gThermValid = false;
     return gThermFilterSeeded ? gThermFiltered : -99.0f;
   }
 
-  // Apply calibration (if needed - normally this should be 0)
+  // Apply baseline calibration
   tempC = tempC * THERM_CAL_GAIN + THERM_CAL_OFFSET_C;
 
-  // IMPORTANT: When USB + battery are connected, ADC can pick up ground loop noise
-  // causing wild temperature spikes. Reject readings that deviate >20°C from the filtered value.
+  // =======================================================
+  // SMOOTHING FILTER
+  // =======================================================
+  static uint8_t outlierCount = 0;
   if (gThermFilterSeeded) {
-    if (fabsf(tempC - gThermFiltered) > 20.0f) {
-      // Outlier detected - ignore this reading and keep filtered value
-      gThermValid = true;
-      return gThermFiltered;
+    // Reject sudden impossible jumps (e.g., >12 degrees in one second)
+    if (fabsf(tempC - gThermFiltered) > 12.0f) {
+      outlierCount++;
+      if (outlierCount < 5) {
+        gThermValid = true;
+        return gThermFiltered;
+      }
     }
+    outlierCount = 0;
   }
 
-  // Apply exponential filter
   if (!gThermFilterSeeded) {
     gThermFiltered = tempC;
     gThermFilterSeeded = true;
   } else {
-    gThermFiltered = gThermFiltered + THERM_FILTER_ALPHA * (tempC - gThermFiltered);
+    const float deltaC = tempC - gThermFiltered;
+    if (fabsf(deltaC) < THERM_FILTER_DEADBAND_C) {
+      gThermFiltered = gThermFiltered + 0.05f * deltaC;
+      gThermValid = true;
+      return gThermFiltered;
+    }
+
+    const float alpha = (fabsf(deltaC) > THERM_FILTER_FAST_DELTA_C)
+      ? THERM_FILTER_ALPHA_FAST
+      : THERM_FILTER_ALPHA;
+    gThermFiltered = gThermFiltered + alpha * deltaC;
   }
 
   gThermValid = true;
   return gThermFiltered;
 }
-
 static bool thermistorTempFromResistance(float rNtc, float r25, float& tempC) {
   const float t0K = T_NOMINAL + 273.15f;
   const float invTK = (1.0f / t0K) + (logf(rNtc / r25) / B_COEFF);
@@ -1641,11 +1675,43 @@ static bool readINA219Register16(uint8_t reg, uint16_t& out) {
 // WIFI CONNECT (with TX power fallback)
 // ================================================================
 static bool consumeWifiSkipRequest() {
+  if (!gAllowWifiSkipDuringConnect) return false;
   if (!isrNextFlag && !isrPrevFlag) return false;
+
+  // Require an actual pressed level to reject stale/noisy ISR flags at boot.
+  bool nextPressed = (digitalRead(BTN_NEXT) == LOW);
+  bool prevPressed = (digitalRead(BTN_PREV) == LOW);
+  if (!nextPressed && !prevPressed) {
+    isrNextFlag = false;
+    isrPrevFlag = false;
+    return false;
+  }
+
   isrNextFlag = false;
   isrPrevFlag = false;
   gIgnoreButtonsUntilMs = millis() + 800;
   return true;
+}
+
+static int loadPreferredWifiIndex() {
+  int fallback = (WIFI_NETWORK_COUNT > 0) ? (int)(WIFI_NETWORK_COUNT - 1) : -1;
+  if (WIFI_NETWORK_COUNT == 0) return fallback;
+
+  if (!prefs.begin(PREF_NS_WIFI, true)) return fallback;
+  uint8_t stored = prefs.getUChar(PREF_KEY_WIFI_LAST_IDX, 0xFF);
+  prefs.end();
+
+  if (stored < WIFI_NETWORK_COUNT) {
+    return (int)stored;
+  }
+  return fallback;
+}
+
+static void savePreferredWifiIndex(size_t wifiIndex) {
+  if (wifiIndex >= WIFI_NETWORK_COUNT) return;
+  if (!prefs.begin(PREF_NS_WIFI, false)) return;
+  prefs.putUChar(PREF_KEY_WIFI_LAST_IDX, (uint8_t)wifiIndex);
+  prefs.end();
 }
 
 static bool connectWiFiNetwork(const char* ssid,
@@ -1657,10 +1723,18 @@ static bool connectWiFiNetwork(const char* ssid,
                                bool& skipRequested) {
   skipRequested = false;
 
-  WiFi.disconnect(true, true);
-  delay(120);
+  // FIX 1: Protejăm modul AP (Hotspot) dacă serviciile offline rulează deja.
+  // Altfel, încercările de reconectare în background îți vor da kick de pe Hotspot.
+  if (gOfflineServicesActive) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
 
-  WiFi.mode(WIFI_STA);
+  // FIX 2: Disconnect simplu, fără 'true, true' pentru a nu stresa flash-ul pe ESP32-C3
+  WiFi.disconnect();
+  delay(100);
+
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.setTxPower(txPower);
@@ -1678,7 +1752,7 @@ static bool connectWiFiNetwork(const char* ssid,
   while (WiFi.status() != WL_CONNECTED) {
     if (consumeWifiSkipRequest()) {
       skipRequested = true;
-      WiFi.disconnect(false, false);
+      WiFi.disconnect();
       Serial.println("[WiFi] Skip requested from button");
       break;
     }
@@ -1688,11 +1762,8 @@ static bool connectWiFiNetwork(const char* ssid,
       break;
     }
 
-    wl_status_t st = WiFi.status();
-    if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST) {
-      // Hard failure for this SSID: move to next quickly.
-      break;
-    }
+    // FIX 3: AM ELIMINAT condiția cu `WL_NO_SSID_AVAIL`. 
+    // Lăsăm timeout-ul să își facă treaba!
 
     uint8_t secLeft = (uint8_t)((deadline - now + 999UL) / 1000UL);
     if (hasOLED && secLeft != lastShownSec) {
@@ -1719,7 +1790,7 @@ static bool connectWiFiNetwork(const char* ssid,
       oled.display();
     }
 
-    delay(80);
+    delay(100); // 100ms e mai safe decât 80ms pentru Watchdog-ul de WiFi
   }
 
   return WiFi.status() == WL_CONNECTED;
@@ -1733,7 +1804,12 @@ static bool connectWiFiFromList() {
     return false;
   }
 
-  for (size_t i = 0; i < WIFI_NETWORK_COUNT; i++) {
+  int preferredIndex = loadPreferredWifiIndex();
+  if (preferredIndex < 0) preferredIndex = 0;
+  Serial.printf("[WiFi] Start order from index %d (%s)\n", preferredIndex, WIFI_SSIDS[preferredIndex]);
+
+  for (size_t attempt = 0; attempt < WIFI_NETWORK_COUNT; attempt++) {
+    size_t i = (preferredIndex + attempt) % WIFI_NETWORK_COUNT;
     bool skipRequested = false;
     if (connectWiFiNetwork(WIFI_SSIDS[i],
                            WIFI_PASSWORDS[i],
@@ -1742,6 +1818,7 @@ static bool connectWiFiFromList() {
                            i,
                            WIFI_NETWORK_COUNT,
                            skipRequested)) {
+      savePreferredWifiIndex(i);
       return true;
     }
 
@@ -2718,9 +2795,8 @@ void setup() {
   Wire.setClock(I2C_FREQ);
   Wire.setTimeOut(50);
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(THERM_PIN, ADC_11db);
-
+analogReadResolution(12);
+analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 3.3V!
   // --- CPU load hook (fallback when runtime stats are unavailable) ---
   bool idleHookOk = false;
 #if CONFIG_FREERTOS_NUMBER_OF_CORES == 1
@@ -2744,6 +2820,7 @@ void setup() {
   // --- Buttons (interrupt-driven) ---
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
+  // Attach early so skip can work during initial Wi-Fi connection.
   attachInterrupt(digitalPinToInterrupt(BTN_NEXT), isrBtnNext, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_PREV), isrBtnPrev, FALLING);
 
@@ -2829,7 +2906,9 @@ void setup() {
   // --- WiFi ---
   isrNextFlag = false;
   isrPrevFlag = false;
+  gAllowWifiSkipDuringConnect = true;
   bool wifiOk = connectWiFiFromList();
+  gAllowWifiSkipDuringConnect = false;
   gIgnoreButtonsUntilMs = millis() + 700;
 
   if (wifiOk) {
@@ -2881,6 +2960,26 @@ void setup() {
 // ================================================================
 void loop() {
   updateConnectivityMode();
+
+  if (WiFi.status() != WL_CONNECTED && millis() - gLastWifiReconnectAttemptMs >= WIFI_RETRY_INTERVAL_MS) {
+    // Punem flagurile pe false
+    isrNextFlag = false;
+    isrPrevFlag = false;
+    gAllowWifiSkipDuringConnect = true;
+
+    Serial.println("[WiFi] Reconnect attempt...");
+    if (connectWiFiFromList()) {
+      Serial.printf("[WiFi] Reconnected: %s\n", WiFi.localIP().toString().c_str());
+      syncClockFromNtp();
+      gWasWifiConnected = true;
+    }
+    
+    gAllowWifiSkipDuringConnect = false;
+    
+    // FIX 4: Resetează timer-ul AICI, DUPĂ ce s-a terminat încercarea de conectare!
+    // Altfel, va intra într-o buclă infinită de reconectare și va bloca toți senzorii.
+    gLastWifiReconnectAttemptMs = millis(); 
+  }
 
   imuWs.loop();
 
