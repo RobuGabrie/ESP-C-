@@ -1,7 +1,7 @@
 /*CEL MAI BUN COD FINAL ZIUA 1, MERGI TOT DAR NU PI WEBSITE
  * ================================================================
- * Hard&Soft Competition - Task 1
- * ESP32-C3 Super Mini — Environmental Monitor (Minimal MQTT)
+ * Hard&Soft Competition - Task 3 (Skydiver Monitor)
+ * ESP32-C3 Super Mini — Environmental Monitor (BLE-Only)
  * ================================================================
  *
  * COMPONENTS:
@@ -11,30 +11,36 @@
  *   - DS1307 RTC module HW-111    (I2C 0x68)
  *   - 10k NTC thermistor divider on GPIO0 (ADC)
  *   - LSM6DS3-compatible gyro      (I2C 0x6A)
+ *   - MPU9250 IMU with AK8963 mag  (I2C 0x68/0x69)
+ *   - MAX30102 (Blood Oxygen/HR)   (I2C 0x57)
  *   - LG INR18650MH1 battery      (3.6V nom, 3200mAh)
  *   - 2x tactile push buttons
  *
+ * COMMUNICATION:
+ *   - BLE (Bluetooth Low Energy) ONLY — no WiFi/Internet
+ *   - Designed for offline operation between wearable and phone
+ *
  * WIRING:
  *   I2C Bus:
- *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3
- *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3
+ *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3, MAX30102, AK8963
+ *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3, MAX30102, AK8963
  *   Thermistor divider:
  *     3.3V -> 10k resistor -> GPIO0 -> 10k NTC -> GND
  *   Buttons (active LOW, internal pull-up):
  *     ESP32 GPIO3 --> Button NEXT --> GND
  *     ESP32 GPIO4 --> Button PREV --> GND
  *
- * FIXES vs original:
- *   - Migrated thermistor to direct ADC read on GPIO0
- *   - Added LSM6DS3 gyroscope readout over I2C
- *   - I2C clock set to 100kHz for DS1307 compatibility
- *   - INA219: explicit 16V/400mA calibration for battery monitoring
- *   - Removed WebServer/HTTP/dashboard — MQTT + OLED only
- *   - Reduced RAM: smaller JSON buffer, no HTML blob
+ * CHANGES from MQTT version:
+ *   - Removed WiFi and MQTT (online mode)
+ *   - Removed WebSocket IMU streaming
+ *   - Added BLE GATT server with sensor characteristics
+ *   - Sensor data published via BLE notifications
+ *   - Offline-only operation for wearable devices
  *
  * LIBRARIES:
  *   - Adafruit SSD1306, Adafruit GFX, Adafruit INA219
- *   - RTClib (Adafruit), PubSubClient, ArduinoJson v7+
+ *   - RTClib (Adafruit), ArduinoJson v7+
+ *   - ESP32 BLE libraries (BLEDevice, BLEServer, etc.)
  */
 
 #include <Arduino.h>
@@ -43,12 +49,7 @@
 #include <stdarg.h>
 
 #include <Wire.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
 #include <Thermistor.h>
-#include <sMQTTBroker.h>
-#include <WebSocketsServer.h>
-#include <qrcode.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_INA219.h>
@@ -61,25 +62,27 @@
 #include <Preferences.h>
 #include <SparkFunMPU9250-DMP.h>
 
+// === BLE Includes ===
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
 extern "C" int min(int a, int b) {
   return (a < b) ? a : b;
 }
 
 // ================================================================
-// CONFIGURATION
+// BLE CONFIGURATION
 // ================================================================
-static const char* WIFI_SSIDS[] = {"stanislav", "Network", "DIGI", "DIGI-75hC", "Orange-6F26"};
-static const char* WIFI_PASSWORDS[] = {"stas1524", "19911313", "27mc2004ca", "9T2Du96euz" , "Zh3tszDsAT4FPN6hNU"};
-static const size_t WIFI_NETWORK_COUNT = std::min(
-  sizeof(WIFI_SSIDS) / sizeof(WIFI_SSIDS[0]),
-  sizeof(WIFI_PASSWORDS) / sizeof(WIFI_PASSWORDS[0])
-);
-static const uint8_t WIFI_ATTEMPT_TIMEOUT_SEC = 12;
-static const uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
-static const char* AP_SSID = "HS-ESP32-OFF";
-static const char* AP_PASS = "esp32hs123";
-static const uint8_t AP_CHANNEL = 6;
-static const uint8_t AP_MAX_CONN = 4;
+#define BLE_DEVICE_NAME "Skydiver-Monitor"
+#define SERVICE_UUID "180D"  // Heart Rate Service
+#define CHAR_SENSOR_DATA_UUID "2A3F"  // Heart Rate Measurement (repurposed)
+#define CHAR_TEMPERATURE_UUID "2A1C"  // Temperature Measurement
+#define CHAR_GYRO_UUID "2A4E"  // Pulse Oxymetry UUID (repurposed for gyro)
+#define CHAR_BATTERY_UUID "2A19"  // Battery Level
+#define CHARACTERISTIC_NOTIFY_UUID "a0000001-1000-1000-8000-00805f9b34fb"
+#define CHARACTERISTIC_IMU_UUID "a0000002-1000-1000-8000-00805f9b34fb"
 
 static const float BATTERY_CAPACITY = 3200.0f;  // mAh
 static const float BATT_REST_CURRENT_MA = 25.0f;  // Rest threshold for OCV correction
@@ -92,23 +95,12 @@ static const uint32_t BATT_PRESENCE_DEBOUNCE_MS = 5000;
 static const float BATT_CURRENT_DEADBAND_MA = 5.0f;
 static const char* PREF_NS = "battery";
 static const char* PREF_KEY_USED_MAH = "used_mAh";
-static const char* PREF_NS_WIFI = "wifi";
-static const char* PREF_KEY_WIFI_LAST_IDX = "last_idx";
 
 // ================================================================
-// MQTT
+// BLE SENSOR PUBLISHING INTERVALS
 // ================================================================
-static const char* MQTT_BROKER      = "broker.emqx.io";
-static const uint16_t MQTT_PORT     = 1883;
-static const char* MQTT_TOPIC       = "hardandsoft/esp32/data";
-static const char* MQTT_RAW_TOPIC   = "hardandsoft/esp32/gpio_raw";
-static const char* MQTT_CMD_TOPIC   = "hardandsoft/esp32/cmd";
-static const char* MQTT_STATE_TOPIC = "hardandsoft/esp32/state";
-static const char* MQTT_USER        = "emqx";
-static const char* MQTT_PASS_MQTT   = "public";
-static const uint32_t IMU_PUBLISH_INTERVAL_MS = 16;  // ~60Hz for smoother VR rendering
-static const uint32_t IMU_PUBLISH_IDLE_INTERVAL_MS = 50;  // Lower background cost when no WS client is connected
-static const uint16_t IMU_WS_PORT = 8001;
+static const uint32_t IMU_PUBLISH_INTERVAL_MS = 100;       // 100ms when BLE connected (~10 Hz)
+static const uint32_t IMU_PUBLISH_IDLE_INTERVAL_MS = 5000; // 5s when BLE not connected (saves power)
 
 // ================================================================
 // PINS
@@ -234,7 +226,7 @@ static const signed char orientationDefault[9] = {0, 1, 0, 0, 0, 1, 1, 0, 0};
 // ================================================================
 static const uint8_t  SCREEN_W      = 128;
 static const uint8_t  SCREEN_H      = 64;
-static const uint8_t  NUM_PAGES     = 10;
+static const uint8_t  NUM_PAGES     = 11;
 static const uint16_t DEBOUNCE_MS   = 200;
 
 // ================================================================
@@ -244,12 +236,22 @@ static Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
 static Adafruit_INA219  ina;
 static RTC_DS1307       rtc;
 static Thermistor       thermistor(R_NOMINAL, R_FIXED, B_COEFF, 12, 3.3, 298.15);
-static WiFiClient       espClient;
-static PubSubClient     mqtt(espClient);
 static Preferences      prefs;
-static sMQTTBroker      localBroker;
-static WebSocketsServer imuWs(IMU_WS_PORT);
 static MPU9250_DMP      mpu;
+
+// === BLE Objects ===
+static BLEServer*       pBleServer = nullptr;
+static BLEService*      pService = nullptr;
+static BLECharacteristic* pCharSensorData = nullptr;
+static BLECharacteristic* pCharTemperature = nullptr;
+static BLECharacteristic* pCharGyro = nullptr;
+static BLECharacteristic* pCharBattery = nullptr;
+static BLECharacteristic* pCharIMU = nullptr;
+static bool bleConnected = false;
+static bool oldBleConnected = false;
+static uint32_t gBleSensorNotifyCount = 0;
+static uint32_t gBleImuNotifyCount = 0;
+static uint32_t gBleImuSkipLogMs = 0;
 
 // ================================================================
 // DEVICE STATUS FLAGS (set during setup, never change after)
@@ -354,7 +356,10 @@ static bool     gBatteryPresent = true;
 // ================================================================
 static volatile int8_t page = 0;
 static uint32_t lastEnergy  = 0;
-
+// Mission Timer State
+static bool gTimerRunning = false;
+static uint32_t gTimerStartMs = 0;
+static uint32_t gTimerElapsedMs = 0;
 // CPU load tracking
 static volatile uint32_t cpuIdleHookCount = 0;
 static uint32_t cpuLastIdleHookCount = 0;
@@ -406,18 +411,12 @@ static volatile bool isrPrevFlag = false;
 static volatile uint16_t gyroDataReadyCount = 0;
 static uint32_t gLastGyroReadMs = 0;
 static uint32_t gIgnoreButtonsUntilMs = 0;
-static bool gOfflineServicesActive = false;
-static bool gLocalBrokerStarted = false;
-static bool gWasWifiConnected = false;
-static bool gAllowWifiSkipDuringConnect = false;
-static uint32_t gLastWifiReconnectAttemptMs = 0;
 static bool gMpuDmpActive = false;
-static uint16_t gImuWsClientCount = 0;
 
-// MQTT client ID
-static String mqttClientId;
+// MQTT client ID (removed — no longer used with BLE)
+// static String mqttClientId;
 
-// Module enable/disable (toggled via MQTT)
+// Module enable/disable (toggled via BLE or default)
 static bool moduleTemp    = true;
 static bool moduleGyro    = true;
 static bool moduleCPU     = true;
@@ -440,7 +439,6 @@ static KalmanAxis gKalPitch = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
 static void publishState();
 static void drawPage();
 static float measureCpuLoadPct();
-static void onImuWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 static void updateEulerFromQuaternion();
 static size_t buildImuJSON(char* buf, size_t bufSize);
 static size_t buildRawGpioJSON(char* buf, size_t bufSize);
@@ -455,14 +453,6 @@ static void cpuStressTask(void* parm);
 static void appendOledLog(const char* fmt, ...);
 static void updateOledRawLog();
 static const char* gpioShortName(uint8_t pin);
-static bool consumeWifiSkipRequest();
-static bool connectWiFiNetwork(const char* ssid,
-                               const char* pass,
-                               uint8_t timeoutSec,
-                               size_t wifiIndex,
-                               size_t wifiTotal,
-                               bool& skipRequested);
-static bool connectWiFiFromList();
 static void scanI2cDevices();
 static const char* i2cDeviceName(uint8_t addr);
 static bool rtcWriteDateTime(int year, int month, int day, int hour, int minute, int second);
@@ -472,12 +462,9 @@ static bool thermistorTempFromResistance(float rNtc, float r25, float& tempC);
 static bool readMagnetometer();
 static float kalmanUpdateAxis(KalmanAxis& k, float measuredAngle, float measuredRate, float dt);
 static void updateOrientationFusion(float dt, float gx, float gy, float gz, float ax, float ay, float az);
-static void drawOfflineQrScreen();
-static void startOfflineServices();
-static void stopOfflineServices();
-static void updateConnectivityMode();
-static int loadPreferredWifiIndex();
-static void savePreferredWifiIndex(size_t wifiIndex);
+static void initBLE();
+static void publishSensorDataBLE();
+static void publishIMUDataBLE();
 
 static float wrapAngle180(float a) {
   while (a > 180.0f) a -= 360.0f;
@@ -795,29 +782,9 @@ static bool systemTimeValid() {
 }
 
 static void syncClockFromNtp() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4", "pool.ntp.org", "time.nist.gov");
-
-  uint8_t tries = 0;
-  while (!systemTimeValid() && tries < 25) {
-    delay(200);
-    tries++;
-  }
-
-  if (hasRTC && systemTimeValid()) {
-    struct tm ti;
-    if (getLocalTime(&ti, 100)) {
-      rtcWriteDateTime(
-        ti.tm_year + 1900,
-        ti.tm_mon + 1,
-        ti.tm_mday,
-        ti.tm_hour,
-        ti.tm_min,
-        ti.tm_sec
-      );
-    }
-  }
+  // Removed: NTP sync no longer available in BLE-only (offline) mode
+  // RTC is used for timekeeping. Set RTC manually if needed via compile time.
+  Serial.println("[TIME] Using RTC for time source (no NTP in offline mode)");
 }
 
 static void loadBatteryState() {
@@ -1064,22 +1031,7 @@ static void cpuStressTask(void* parm) {
   }
 }
 
-static void onImuWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  (void)payload;
-  (void)length;
-  switch (type) {
-    case WStype_CONNECTED:
-      gImuWsClientCount = imuWs.connectedClients();
-      Serial.printf("[IMU-WS] Client %u connected (%u total)\n", num, gImuWsClientCount);
-      break;
-    case WStype_DISCONNECTED:
-      gImuWsClientCount = imuWs.connectedClients();
-      Serial.printf("[IMU-WS] Client %u disconnected (%u total)\n", num, gImuWsClientCount);
-      break;
-    default:
-      break;
-  }
-}
+// WebSocket handler removed - now using BLE notifications instead
 
 // ================================================================
 // ISRs (buttons only — sensor read uses millis() for portability)
@@ -1672,238 +1624,294 @@ static bool readINA219Register16(uint8_t reg, uint16_t& out) {
 }
 
 // ================================================================
-// WIFI CONNECT (with TX power fallback)
+// BLE SERVER CALLBACKS AND INITIALIZATION
 // ================================================================
-static bool consumeWifiSkipRequest() {
-  if (!gAllowWifiSkipDuringConnect) return false;
-  if (!isrNextFlag && !isrPrevFlag) return false;
 
-  // Require an actual pressed level to reject stale/noisy ISR flags at boot.
-  bool nextPressed = (digitalRead(BTN_NEXT) == LOW);
-  bool prevPressed = (digitalRead(BTN_PREV) == LOW);
-  if (!nextPressed && !prevPressed) {
-    isrNextFlag = false;
-    isrPrevFlag = false;
-    return false;
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    bleConnected = true;
+    Serial.println("[BLE] Client connected");
   }
 
-  isrNextFlag = false;
-  isrPrevFlag = false;
-  gIgnoreButtonsUntilMs = millis() + 800;
-  return true;
-}
-
-static int loadPreferredWifiIndex() {
-  int fallback = (WIFI_NETWORK_COUNT > 0) ? (int)(WIFI_NETWORK_COUNT - 1) : -1;
-  if (WIFI_NETWORK_COUNT == 0) return fallback;
-
-  if (!prefs.begin(PREF_NS_WIFI, true)) return fallback;
-  uint8_t stored = prefs.getUChar(PREF_KEY_WIFI_LAST_IDX, 0xFF);
-  prefs.end();
-
-  if (stored < WIFI_NETWORK_COUNT) {
-    return (int)stored;
+  void onDisconnect(BLEServer* pServer) {
+    bleConnected = false;
+    Serial.println("[BLE] Client disconnected");
+    pServer->startAdvertising();  // Restart advertising
   }
-  return fallback;
-}
+};
 
-static void savePreferredWifiIndex(size_t wifiIndex) {
-  if (wifiIndex >= WIFI_NETWORK_COUNT) return;
-  if (!prefs.begin(PREF_NS_WIFI, false)) return;
-  prefs.putUChar(PREF_KEY_WIFI_LAST_IDX, (uint8_t)wifiIndex);
-  prefs.end();
-}
 
-static bool connectWiFiNetwork(const char* ssid,
-                               const char* pass,
-                               wifi_power_t txPower,
-                               uint8_t timeoutSec,
-                               size_t wifiIndex,
-                               size_t wifiTotal,
-                               bool& skipRequested) {
-  skipRequested = false;
+// ---> PASTE THE NEW CLASS RIGHT HERE <---
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string rxValue = pCharacteristic->getValue();
+    if (rxValue.length() > 0) {
+      Serial.printf("[BLE] Received %d bytes: ", (int)rxValue.length());
+      
+      // Convert to Arduino String for easy parsing
+      String cmd = "";
+      for (int i = 0; i < rxValue.length(); i++) {
+        cmd += rxValue[i];
+      }
+      Serial.println(cmd);
 
-  // FIX 1: Protejăm modul AP (Hotspot) dacă serviciile offline rulează deja.
-  // Altfel, încercările de reconectare în background îți vor da kick de pe Hotspot.
-  if (gOfflineServicesActive) {
-    WiFi.mode(WIFI_AP_STA);
-  } else {
-    WiFi.mode(WIFI_STA);
-  }
+      cmd.trim();
+      cmd.toUpperCase();
 
-  // FIX 2: Disconnect simplu, fără 'true, true' pentru a nu stresa flash-ul pe ESP32-C3
-  WiFi.disconnect();
-  delay(100);
-
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.setTxPower(txPower);
-  WiFi.begin(ssid, pass);
-
-  Serial.printf("[WiFi] Trying %s (%u/%u, tx=%d)\n",
-                ssid,
-                (unsigned)(wifiIndex + 1),
-                (unsigned)wifiTotal,
-                (int)txPower);
-
-  uint32_t deadline = millis() + ((uint32_t)timeoutSec * 1000UL);
-  uint8_t lastShownSec = 255;
-
-  while (WiFi.status() != WL_CONNECTED) {
-    if (consumeWifiSkipRequest()) {
-      skipRequested = true;
-      WiFi.disconnect();
-      Serial.println("[WiFi] Skip requested from button");
-      break;
-    }
-
-    uint32_t now = millis();
-    if ((int32_t)(deadline - now) <= 0) {
-      break;
-    }
-
-    // FIX 3: AM ELIMINAT condiția cu `WL_NO_SSID_AVAIL`. 
-    // Lăsăm timeout-ul să își facă treaba!
-
-    uint8_t secLeft = (uint8_t)((deadline - now + 999UL) / 1000UL);
-    if (hasOLED && secLeft != lastShownSec) {
-      lastShownSec = secLeft;
-      oled.clearDisplay();
-      oled.fillRect(0, 0, 128, OLED_TITLE_H, SSD1306_WHITE);
-      oled.setTextColor(SSD1306_BLACK);
-      oled.setTextSize(1);
-      oled.setCursor(2, OLED_TITLE_TEXT_Y);
-      oled.printf("WiFi %u/%u", (unsigned)(wifiIndex + 1), (unsigned)wifiTotal);
-      oled.setTextColor(SSD1306_WHITE);
-      oled.setCursor(0, 20);
-      oled.print(ssid);
-      oled.setCursor(0, 56);
-      oled.print("BTN=SKIP");
-
-      char secText[4];
-      snprintf(secText, sizeof(secText), "%u", secLeft);
-      oled.setTextSize(4);
-      int x = (128 - ((int)strlen(secText) * 24)) / 2;
-      if (x < 0) x = 0;
-      oled.setCursor(x, 30);
-      oled.print(secText);
-      oled.display();
-    }
-
-    delay(100); // 100ms e mai safe decât 80ms pentru Watchdog-ul de WiFi
-  }
-
-  return WiFi.status() == WL_CONNECTED;
-}
-
-static bool connectWiFiFromList() {
-  const wifi_power_t txLevel = WIFI_POWER_13dBm;
-
-  if (WIFI_NETWORK_COUNT == 0) {
-    Serial.println("[WiFi] No SSID configured");
-    return false;
-  }
-
-  int preferredIndex = loadPreferredWifiIndex();
-  if (preferredIndex < 0) preferredIndex = 0;
-  Serial.printf("[WiFi] Start order from index %d (%s)\n", preferredIndex, WIFI_SSIDS[preferredIndex]);
-
-  for (size_t attempt = 0; attempt < WIFI_NETWORK_COUNT; attempt++) {
-    size_t i = (preferredIndex + attempt) % WIFI_NETWORK_COUNT;
-    bool skipRequested = false;
-    if (connectWiFiNetwork(WIFI_SSIDS[i],
-                           WIFI_PASSWORDS[i],
-                           txLevel,
-                           WIFI_ATTEMPT_TIMEOUT_SEC,
-                           i,
-                           WIFI_NETWORK_COUNT,
-                           skipRequested)) {
-      savePreferredWifiIndex(i);
-      return true;
-    }
-
-    if (skipRequested) {
-      Serial.printf("[WiFi] Skipped by user: %s\n", WIFI_SSIDS[i]);
-    } else {
-      Serial.printf("[WiFi] Failed: %s\n", WIFI_SSIDS[i]);
-    }
-
-    Serial.printf("[WiFi] Next network after %s\n", WIFI_SSIDS[i]);
-  }
-
-  return false;
-}
-
-static void drawOfflineQrScreen() {
-  if (!hasOLED) return;
-
-  // Note: This function is now mainly kept for reference.
-  // QR display is now integrated into pageWiFi() for offline mode.
-  
-  char wifiQr[96];
-  snprintf(wifiQr, sizeof(wifiQr), "WIFI:T:WPA;S:%s;P:%s;;", AP_SSID, AP_PASS);
-
-  QRCode qrcode;
-  uint8_t qrData[qrcode_getBufferSize(2)];
-  if (qrcode_initText(&qrcode, qrData, 2, ECC_LOW, wifiQr) < 0) return;
-
-  const int scale = 2;
-  const int qrSize = qrcode.size * scale;
-  const int x0 = (SCREEN_W - qrSize) / 2;
-  const int y0 = 12;  // Start below title area
-
-  // Draw QR code without interfering with title
-  for (uint8_t y = 0; y < qrcode.size; y++) {
-    for (uint8_t x = 0; x < qrcode.size; x++) {
-      if (qrcode_getModule(&qrcode, x, y)) {
-        oled.fillRect(x0 + x * scale, y0 + y * scale, scale, scale, SSD1306_WHITE);
+      // Timer Controls via BLE
+      if (cmd == "START") {
+        if (!gTimerRunning) {
+          gTimerStartMs = millis() - gTimerElapsedMs; // Resumes from paused time
+          gTimerRunning = true;
+          Serial.println("[TIMER] Started!");
+        }
+      } 
+      else if (cmd == "STOP") {
+        if (gTimerRunning) {
+          gTimerElapsedMs = millis() - gTimerStartMs;
+          gTimerRunning = false;
+          Serial.println("[TIMER] Stopped!");
+        }
+      } 
+      else if (cmd == "RESET") {
+        gTimerRunning = false;
+        gTimerElapsedMs = 0;
+        Serial.println("[TIMER] Reset!");
       }
     }
   }
+};
+
+static void initBLE() {
+  Serial.println("[BLE] Initializing BLE...");
+
+  // Raise ATT MTU so JSON notifications are less likely to be truncated.
+  BLEDevice::setMTU(247);
+  
+  // Initialize BLE device
+  BLEDevice::init(BLE_DEVICE_NAME);
+  
+  // Create BLE server
+  pBleServer = BLEDevice::createServer();
+  pBleServer->setCallbacks(new MyServerCallbacks());
+  
+  // Create BLE service
+  pService = pBleServer->createService(SERVICE_UUID);
+  
+  // Create BLE characteristics for sensor data
+  pCharSensorData = pService->createCharacteristic(
+    CHARACTERISTIC_NOTIFY_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY |
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  pCharSensorData->addDescriptor(new BLE2902());
+  pCharSensorData->setCallbacks(new MyCharacteristicCallbacks());
+  
+  // Temperature characteristic
+  pCharTemperature = pService->createCharacteristic(
+    CHAR_TEMPERATURE_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pCharTemperature->addDescriptor(new BLE2902());
+  
+  // Gyro characteristic
+  pCharGyro = pService->createCharacteristic(
+    CHAR_GYRO_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pCharGyro->addDescriptor(new BLE2902());
+  
+  // Battery characteristic
+  pCharBattery = pService->createCharacteristic(
+    CHAR_BATTERY_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pCharBattery->addDescriptor(new BLE2902());
+  
+  // IMU characteristic (custom UUID for full IMU data)
+  pCharIMU = pService->createCharacteristic(
+    CHARACTERISTIC_IMU_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pCharIMU->addDescriptor(new BLE2902());
+  
+  // Start service
+  pService->start();
+  
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMaxPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.printf("[BLE] BLE Advertising started - Device Name: %s\n", BLE_DEVICE_NAME);
 }
 
-static void startOfflineServices() {
-  if (gOfflineServicesActive) return;
+static void publishSensorDataBLE() {
+  if (!bleConnected || !pCharSensorData) return;
+  
+  // Build JSON with sensor data
+  char buf[384];
+  JsonDocument doc;
+  
+  doc["ts"] = gTimestamp;
+  doc["up"] = gUptime;
+  
+  if (moduleTemp && gThermValid) {
+    float ntcTemp = roundf(gTemp * 10.0f) / 10.0f;
+    doc["temp"] = ntcTemp;
+  }
+  
+  if (moduleGyro && hasGyro) {
+    doc["gx"] = roundf(gGyroX * 10.0f) / 10.0f;
+    doc["gy"] = roundf(gGyroY * 10.0f) / 10.0f;
+    doc["gz"] = roundf(gGyroZ * 10.0f) / 10.0f;
 
-  WiFi.mode(WIFI_AP_STA);
-  if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CONN)) {
-    Serial.println("[AP] Failed to start hotspot");
+    // Mirror orientation into the main stream so apps that only subscribe
+    // to a0000001 still receive quaternion and Euler angles.
+    float q0 = isfinite(gQuat0) ? gQuat0 : 1.0f;
+    float q1 = isfinite(gQuat1) ? gQuat1 : 0.0f;
+    float q2 = isfinite(gQuat2) ? gQuat2 : 0.0f;
+    float q3 = isfinite(gQuat3) ? gQuat3 : 0.0f;
+    float qn = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    if (qn > 1e-6f) {
+      q0 /= qn;
+      q1 /= qn;
+      q2 /= qn;
+      q3 /= qn;
+    } else {
+      q0 = 1.0f;
+      q1 = 0.0f;
+      q2 = 0.0f;
+      q3 = 0.0f;
+    }
+
+    doc["q0"] = roundf(q0 * 10000.0f) / 10000.0f;
+    doc["q1"] = roundf(q1 * 10000.0f) / 10000.0f;
+    doc["q2"] = roundf(q2 * 10000.0f) / 10000.0f;
+    doc["q3"] = roundf(q3 * 10000.0f) / 10000.0f;
+    doc["roll"] = roundf(gRoll * 100.0f) / 100.0f;
+    doc["pitch"] = roundf(gPitch * 100.0f) / 100.0f;
+    doc["yaw"] = roundf(gYaw * 100.0f) / 100.0f;
+    doc["stationary"] = (gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES);
+    doc["imu_seq"] = gBleImuNotifyCount;
+  }
+  
+  if (moduleCurrent) {
+    doc["v"] = roundf(gVoltage * 100.0f) / 100.0f;
+    doc["ma"] = roundf(gCurrentMA * 10.0f) / 10.0f;
+    doc["batt"] = roundf(gBattPct * 10.0f) / 10.0f;
+  }
+
+  if (moduleCPU) {
+    doc["cpu"] = roundf(gCpuLoad * 10.0f) / 10.0f;
+  }
+  
+  size_t needed = measureJson(doc);
+  if (needed >= sizeof(buf)) {
+    Serial.printf("[BLE] Sensor payload too large: needed=%u, max=%u (drop)\n",
+                  (unsigned)needed,
+                  (unsigned)(sizeof(buf) - 1));
+    return;
+  }
+
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len == needed) {
+    pCharSensorData->setValue((uint8_t*)buf, len);
+    pCharSensorData->notify();
+    gBleSensorNotifyCount++;
+
+    // Mirror selected values to standard characteristics for generic BLE apps.
+    if (pCharTemperature && moduleTemp && gThermValid) {
+      char tbuf[16];
+      int tlen = snprintf(tbuf, sizeof(tbuf), "%.1f", gTemp);
+      if (tlen > 0) {
+        pCharTemperature->setValue((uint8_t*)tbuf, (size_t)tlen);
+        pCharTemperature->notify();
+      }
+    }
+
+    if (pCharBattery) {
+      uint8_t batt = (uint8_t)constrain((int)roundf(gBattPct), 0, 100);
+      pCharBattery->setValue(&batt, 1);
+      pCharBattery->notify();
+    }
+
+    if (pCharGyro && moduleGyro && hasGyro) {
+      float gabs = sqrtf(gGyroX * gGyroX + gGyroY * gGyroY + gGyroZ * gGyroZ);
+      char gbuf[16];
+      int glen = snprintf(gbuf, sizeof(gbuf), "%.1f", gabs);
+      if (glen > 0) {
+        pCharGyro->setValue((uint8_t*)gbuf, (size_t)glen);
+        pCharGyro->notify();
+      }
+    }
+
+    if ((gBleSensorNotifyCount % 10) == 0) {
+      Serial.printf("[BLE] Sensor notify #%lu, len=%u\n",
+                    (unsigned long)gBleSensorNotifyCount,
+                    (unsigned)len);
+    }
   } else {
-    Serial.printf("[AP] SSID:%s IP:%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+    Serial.printf("[BLE] Sensor serialize mismatch: len=%u needed=%u (drop)\n",
+                  (unsigned)len,
+                  (unsigned)needed);
   }
-
-  if (!gLocalBrokerStarted) {
-    gLocalBrokerStarted = localBroker.init(1883, true);
-    Serial.printf("[MQTT-LOCAL] %s\n", gLocalBrokerStarted ? "Broker started" : "Broker start failed");
-  }
-
-  gOfflineServicesActive = true;
-  // Display refresh will happen naturally in the main loop's drawPage() call
 }
 
-static void stopOfflineServices() {
-  if (!gOfflineServicesActive) return;
-
-  WiFi.softAPdisconnect(true);
-  gOfflineServicesActive = false;
-  Serial.println("[AP] Hotspot stopped");
-}
-
-static void updateConnectivityMode() {
-  bool online = (WiFi.status() == WL_CONNECTED);
-
-  if (online && !gWasWifiConnected) {
-    syncClockFromNtp();
-    Serial.println("[NTP] Sync on WiFi reconnect");
+static void publishIMUDataBLE() {
+  if (!bleConnected) return;
+  if (!pCharIMU) {
+    uint32_t now = millis();
+    if (now - gBleImuSkipLogMs >= 3000) {
+      gBleImuSkipLogMs = now;
+      Serial.println("[BLE] IMU notify skipped: pCharIMU is null");
+    }
+    return;
   }
-  gWasWifiConnected = online;
-
-  if (!online) {
-    startOfflineServices();
+  
+  char buf[512];
+  JsonDocument doc;
+  
+  float q0 = isfinite(gQuat0) ? gQuat0 : 1.0f;
+  float q1 = isfinite(gQuat1) ? gQuat1 : 0.0f;
+  float q2 = isfinite(gQuat2) ? gQuat2 : 0.0f;
+  float q3 = isfinite(gQuat3) ? gQuat3 : 0.0f;
+  
+  float qn = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  if (qn > 1e-6f) {
+    q0 /= qn; q1 /= qn; q2 /= qn; q3 /= qn;
   } else {
-    stopOfflineServices();
+    q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
+  }
+  
+  doc["up"] = gUptime;
+  doc["q0"] = roundf(q0 * 10000.0f) / 10000.0f;
+  doc["q1"] = roundf(q1 * 10000.0f) / 10000.0f;
+  doc["q2"] = roundf(q2 * 10000.0f) / 10000.0f;
+  doc["q3"] = roundf(q3 * 10000.0f) / 10000.0f;
+  doc["roll"] = roundf(gRoll * 100.0f) / 100.0f;
+  doc["pitch"] = roundf(gPitch * 100.0f) / 100.0f;
+  doc["yaw"] = roundf(gYaw * 100.0f) / 100.0f;
+  doc["stationary"] = (gMotionStillCount >= ZUPT_STILL_REQUIRED_SAMPLES);
+  
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len < sizeof(buf)) {
+    pCharIMU->setValue((uint8_t*)buf, len);
+    pCharIMU->notify();
+    gBleImuNotifyCount++;
+    if ((gBleImuNotifyCount % 20) == 0) {
+      Serial.printf("[BLE] IMU notify #%lu, len=%u\n",
+                    (unsigned long)gBleImuNotifyCount,
+                    (unsigned)len);
+    }
   }
 }
+
 
 // ================================================================
 // READ ALL SENSORS
@@ -2089,13 +2097,13 @@ static void readOtherSensors() {
     gBattLife = -1.0f;
   }
 
-  // --- WiFi ---
-  gRSSI = WiFi.RSSI();
+  // --- WiFi --- (Removed - now BLE-only)
+  gRSSI = 0;  // Not applicable for BLE
 
   // --- CPU load ---
   gCpuLoad = measureCpuLoadPct();
 
-  // --- OLED log feed uses same raw sources as MQTT raw payload ---
+  // --- OLED log feed uses same raw sources ---
   updateOledRawLog();
 }
 
@@ -2189,10 +2197,10 @@ static size_t buildJSON(char* buf, size_t bufSize) {
   else               doc["batt"] = nullptr;
 
   doc["batt_min"] = (moduleCurrent && gBatteryPresent && gBattLife > 0) ? (int)gBattLife : -1;
-  doc["ssid"]   = WiFi.SSID();
-  doc["ip"]     = WiFi.localIP().toString();
-  doc["mac"]    = WiFi.macAddress();
-  doc["channel"] = (int)WiFi.channel();
+  
+  // BLE connection status instead of WiFi
+  doc["ble_connected"] = bleConnected;
+  doc["device_name"] = BLE_DEVICE_NAME;
 
   return serializeJson(doc, buf, bufSize);
 }
@@ -2352,69 +2360,15 @@ static size_t buildRawGpioJSON(char* buf, size_t bufSize) {
 // ================================================================
 // MQTT CONNECT
 // ================================================================
-static void connectMqtt() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  Serial.printf("[MQTT] Connecting to %s...\n", MQTT_BROKER);
-  if (mqtt.connect(mqttClientId.c_str(), MQTT_USER, MQTT_PASS_MQTT)) {
-    Serial.println("[MQTT] Connected");
-    mqtt.subscribe(MQTT_CMD_TOPIC);
-    mqtt.publish(MQTT_TOPIC, "{\"status\":\"online\"}");
-    publishState();
-  } else {
-    Serial.printf("[MQTT] Failed rc=%d\n", mqtt.state());
-  }
-}
-
 // ================================================================
-// PUBLISH MODULE STATE
+// BLE PUBLISH (replaces MQTT)
 // ================================================================
+// Note: actual BLE publishing is handled by publishSensorDataBLE() and publishIMUDataBLE()
+// which are called from the loop
+
 static void publishState() {
-  char buf[128];
-  JsonDocument doc;
-  JsonObject m = doc["modules"].to<JsonObject>();
-  m["temperature"] = moduleTemp;
-  m["gyro"]        = moduleGyro;
-  m["cpu"]         = moduleCPU;
-  m["current"]     = moduleCurrent;
-  m["cpu_stress"]  = moduleCpuStress;
-  serializeJson(doc, buf, sizeof(buf));
-  mqtt.publish(MQTT_STATE_TOPIC, buf);
-}
-
-// ================================================================
-// MQTT MESSAGE HANDLER
-// ================================================================
-static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  (void)topic;
-
-  // Stack-allocate: no heap fragmentation
-  char msg[128];
-  size_t len = min((unsigned int)(sizeof(msg) - 1), length);
-  memcpy(msg, payload, len);
-  msg[len] = '\0';
-
-  Serial.printf("[MQTT] Rx: %s\n", msg);
-
-  JsonDocument doc;
-  if (deserializeJson(doc, msg) != DeserializationError::Ok) return;
-
-  const char* mod = doc["module"];
-  if (!mod) return;
-
-  bool en = doc["enabled"] | false;
-
-  if      (strcmp(mod, "temperature") == 0)  moduleTemp    = en;
-  else if (strcmp(mod, "gyro") == 0)         moduleGyro    = en;
-  else if (strcmp(mod, "cpu") == 0)          moduleCPU     = en;
-  else if (strcmp(mod, "current") == 0)      moduleCurrent = en;
-  else if (strcmp(mod, "cpu_stress") == 0) {
-    moduleCpuStress = en;
-    if (en) moduleCPU = true;
-  }
-
-  Serial.printf("[MQTT] %s -> %s\n", mod, en ? "ON" : "OFF");
-  publishState();
+  // In BLE mode, module state is communicated via BLE characteristics
+  Serial.println("[BLE] Module state updated");
 }
 
 // ================================================================
@@ -2456,306 +2410,427 @@ static void handleButtons() {
     }
   }
 }
-
 // ================================================================
-// OLED UTILITIES
+// OLED UTILITIES (HUD Redesign)
 // ================================================================
 static void drawTitleBar(const char* title) {
-  oled.fillRect(0, 0, 128, OLED_TITLE_H, SSD1306_WHITE);
+  // Inverted heavy header for clear page separation
+  oled.fillRect(0, 0, 128, 14, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
   oled.setTextSize(1);
-  int x = (102 - (int)strlen(title) * 6) / 2;
-  if (x < 1) x = 1;
-  oled.setCursor(x, OLED_TITLE_TEXT_Y);
-  oled.print(title);
+  
+  // If disconnected, flash a warning every second (except on page 3 where it's already obvious)
+  if (!bleConnected && page != 3 && (millis() / 1000) % 2 == 0) {
+    int wx = (128 - 13 * 6) / 2; // "! LINK LOST !" is 13 chars
+    oled.setCursor(max(2, wx), 3);
+    oled.print("! LINK LOST !");
+  } else {
+    // Normal title
+    int x = (128 - (int)strlen(title) * 6) / 2;
+    oled.setCursor(max(2, x), 3);
+    oled.print(title);
+  }
 
-  oled.setCursor(103, OLED_TITLE_TEXT_Y);
+  // Page indicator in top right
+  oled.setCursor(104, 3);
   oled.printf("%d/%d", page + 1, NUM_PAGES);
-  oled.setTextColor(SSD1306_WHITE);
+  
+  oled.setTextColor(SSD1306_WHITE); // Reset for rest of screen
+}
+// --- Custom UI Graphics ---
+
+static void drawDynamicBattery(int x, int y, int w, int h, float pct) {
+  pct = constrain(pct, 0.0f, 100.0f);
+  oled.drawRect(x, y, w - 2, h, SSD1306_WHITE); // Main body
+  oled.fillRect(x + w - 2, y + h / 4, 2, h / 2, SSD1306_WHITE); // Positive terminal nub
+  int fillW = (int)((pct / 100.0f) * (w - 6));
+  if (fillW > 0) {
+    oled.fillRect(x + 2, y + 2, fillW, h - 4, SSD1306_WHITE);
+  }
 }
 
-static void drawProgressBar(int x, int y, int w, int h, float pct) {
+static void drawBluetoothLogo(int x, int y) {
+  // Classic Bluetooth rune drawn with lines
+  oled.drawLine(x + 4, y, x + 4, y + 12, SSD1306_WHITE);     // Center vertical
+  oled.drawLine(x + 4, y, x + 8, y + 3, SSD1306_WHITE);      // Top right triangle
+  oled.drawLine(x + 8, y + 3, x, y + 9, SSD1306_WHITE);      // Cross down-left
+  oled.drawLine(x + 4, y + 12, x + 8, y + 9, SSD1306_WHITE); // Bottom right triangle
+  oled.drawLine(x + 8, y + 9, x, y + 3, SSD1306_WHITE);      // Cross up-left
+}
+
+static void drawThermometerIcon(int x, int y, float pct) {
   pct = constrain(pct, 0.0f, 100.0f);
-  oled.drawRoundRect(x, y, w, h, 3, SSD1306_WHITE);
-  int fw = (int)(pct / 100.0f * (w - 4));
-  if (fw > 0) oled.fillRoundRect(x + 2, y + 2, fw, h - 4, 2, SSD1306_WHITE);
+  oled.drawRoundRect(x, y, 6, 24, 3, SSD1306_WHITE); // Glass tube
+  oled.fillCircle(x + 2, y + 26, 5, SSD1306_WHITE);  // Bulb
+  int fillH = (int)(pct / 100.0f * 18.0f);
+  if (fillH > 0) {
+    oled.fillRect(x + 2, y + 22 - fillH, 2, fillH, SSD1306_WHITE); // Mercury level
+  }
+}
+
+static void drawArtificialHorizon(int cx, int cy, int r, float pitch, float roll) {
+  oled.drawCircle(cx, cy, r, SSD1306_WHITE); // Gauge bezel
+  
+  float rad = roll * 0.0174533f; // Convert to radians
+  float s = sin(rad);
+  float c = cos(rad);
+  
+  // Offset the line based on pitch (clamped to keep inside gauge)
+  int p_off = constrain((int)(pitch * 0.5f), -(r - 2), (r - 2));
+  
+  int x1 = cx - (r - 2) * c + p_off * s;
+  int y1 = cy - (r - 2) * s - p_off * c;
+  int x2 = cx + (r - 2) * c + p_off * s;
+  int y2 = cy + (r - 2) * s - p_off * c;
+  
+  oled.drawLine(x1, y1, x2, y2, SSD1306_WHITE); // Horizon line
+  oled.drawPixel(cx, cy, SSD1306_WHITE);        // Center reticle
 }
 
 static void drawCentered(const char* text, int y, int sz) {
   oled.setTextSize(sz);
   int x = (128 - (int)strlen(text) * 6 * sz) / 2;
-  if (x < 0) x = 0;
-  oled.setCursor(x, y);
+  oled.setCursor(max(0, x), y);
   oled.print(text);
-}
-
-static void printDegC() {
-  oled.write(248);  // Degree symbol in cp437 for Adafruit GFX default font
-  oled.print("C");
 }
 
 // ================================================================
 // OLED PAGES
 // ================================================================
 static void pageDashboard() {
-  drawTitleBar("MONITOR");
+  drawTitleBar("DASHBOARD HUD");
 
-  oled.setTextColor(SSD1306_WHITE);
+  // Strict HUD division lines (Prevents text crossover)
+  oled.drawLine(60, 14, 60, 64, SSD1306_WHITE); // Vertical split
+  oled.drawLine(60, 39, 128, 39, SSD1306_WHITE); // Right-side horizontal split
+
+  // ==========================================
+  // LEFT PANEL: Huge Temperature
+  // ==========================================
   oled.setTextSize(1);
-  if (strlen(gTimestamp) >= 19) {
-    oled.setCursor(0, 18);
-    char hhmmss[9];
-    memcpy(hhmmss, gTimestamp + 11, 8);
-    hhmmss[8] = '\0';
-    oled.printf("ORA: %s", hhmmss);
-  }
+  oled.setCursor(4, 18); 
+  oled.print("TEMP C");
+  
+  oled.setTextSize(2);
+  char tBuf[8]; 
+  snprintf(tBuf, sizeof(tBuf), "%.1f", gTemp);
+  // Auto-center the temperature in the 60px wide left box
+  int tx = (60 - strlen(tBuf) * 12) / 2;
+  oled.setCursor(max(2, tx), 36); 
+  oled.print(tBuf);
 
-  oled.setCursor(0, 28);  oled.printf("T:%.1f", gTemp); printDegC();
-  oled.setCursor(68, 28); oled.printf("G:%.0f", gGyroAbs);
-  oled.setCursor(0, 38);  oled.printf("P:%.0fmW", gPowerMW);
-  oled.setCursor(68, 38); oled.printf("C:%.0fmA", gCurrentMA);
-  oled.setCursor(0, 48);  oled.printf("R:%ddBm", gRSSI);
-  oled.setCursor(68, 48); oled.printf("CPU:%d%%", (int)roundf(gCpuLoad));
-
-  drawProgressBar(0, 56, 104, 8, gBattPct);
-  oled.setCursor(108, 56);
+  // ==========================================
+  // TOP RIGHT PANEL: Battery & Status
+  // ==========================================
+  drawDynamicBattery(65, 18, 20, 8, gBattPct);
+  oled.setTextSize(1);
+  oled.setCursor(89, 18); 
   oled.printf("%.0f%%", gBattPct);
-}
+  
+  oled.setCursor(65, 29); 
+  if (gCurrentMA > 10.0f) oled.print("DISCHRG");
+  else if (gCurrentMA < -10.0f) oled.print("CHARGING");
+  else oled.print("STABLE");
 
-static void pageTemp() {
-  drawTitleBar("TEMPERATURA");
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.1f", gTemp);
-  int numW = strlen(buf) * 18;
-  int sx = (128 - numW - 14) / 2;
-  if (sx < 0) sx = 0;
-  oled.setTextSize(3); oled.setCursor(sx, 18); oled.print(buf);
-  int cx = sx + numW + 6;
-  int cy = 22;
-  oled.setTextSize(2); oled.setCursor(cx, cy); oled.print("C");
-  oled.drawCircle(cx - 4, cy + 1, 1, SSD1306_WHITE);
-  float pct = constrain((gTemp + 10.0f) / 60.0f * 100.0f, 0, 100);
-  drawProgressBar(4, 48, 120, 8, pct);
+  // ==========================================
+  // BOTTOM RIGHT PANEL: Comms & CPU
+  // ==========================================
+  drawBluetoothLogo(65, 46);
+  oled.setCursor(76, 44); 
+  oled.print(bleConnected ? "SYNCED" : "SEARCH");
+  
+  oled.setCursor(76, 54); 
+  oled.printf("CPU:%d%%", (int)gCpuLoad);
 }
+static void pageRTC() {
+  drawTitleBar("MISSION TIMER");
 
-static void pageGyro() {
-  drawTitleBar("GIROSCOP");
-  oled.setTextSize(1);
-  oled.setCursor(0, 18); oled.printf("X:%7.2f dps", gGyroX);
-  oled.setCursor(0, 28); oled.printf("Y:%7.2f dps", gGyroY);
-  oled.setCursor(0, 38); oled.printf("Z:%7.2f dps", gGyroZ);
-  oled.setCursor(0, 48); oled.printf("ABS:%6.2f dps", gGyroAbs);
-  float gyroPct = constrain(gGyroAbs / 10.0f, 0.0f, 100.0f);
-  drawProgressBar(4, 56, 120, 8, gyroPct);
-}
+  // ==========================================
+  // CALCULARE TIMP LIVE
+  // ==========================================
+  uint32_t currentElapsed = gTimerElapsedMs;
+  if (gTimerRunning) {
+    currentElapsed = millis() - gTimerStartMs;
+  }
 
-static void pageWiFi() {
-  if (gOfflineServicesActive) {
-    // === OFFLINE MODE: Show credentials and QR code ===
-    drawTitleBar("HOTSPOT OFFLINE");
-    
-    // Left side: credentials
-    oled.setTextSize(1);
-    oled.setCursor(0, 18);
-    oled.print("SSID:");
-    oled.setTextSize(1);
-    oled.setCursor(0, 28);
-    oled.print(AP_SSID);
-    
-    oled.setTextSize(1);
-    oled.setCursor(0, 40);
-    oled.print("Pass:");
-    oled.setTextSize(1);
-    oled.setCursor(0, 50);
-    oled.print(AP_PASS);
-    
-    // Right side: small QR code
-    char wifiQr[96];
-    snprintf(wifiQr, sizeof(wifiQr), "WIFI:T:WPA;S:%s;P:%s;;", AP_SSID, AP_PASS);
-    
-    QRCode qrcode;
-    uint8_t qrData[qrcode_getBufferSize(1)];  // Version 1 - smaller
-    if (qrcode_initText(&qrcode, qrData, 1, ECC_LOW, wifiQr) == 0) {
-      const int scale = 1;
-      const int qrSize = qrcode.size * scale;
-      const int x0 = 128 - qrSize - 2;
-      const int y0 = 18;
-      
-      for (uint8_t y = 0; y < qrcode.size; y++) {
-        for (uint8_t x = 0; x < qrcode.size; x++) {
-          if (qrcode_getModule(&qrcode, x, y)) {
-            oled.fillRect(x0 + x * scale, y0 + y * scale, scale, scale, SSD1306_WHITE);
-          }
-        }
-      }
+  uint32_t totalSec = currentElapsed / 1000;
+  uint32_t m = totalSec / 60;
+  uint32_t s = totalSec % 60;
+  uint32_t ms10 = (currentElapsed % 1000) / 100; // Zecimi de secundă
+
+  // ==========================================
+  // MAIN HUD: Stopwatch Split-Typography
+  // ==========================================
+  char mainTime[6];
+  snprintf(mainTime, sizeof(mainTime), "%02lu:%02lu", m, s);
+  
+  char decTime[3];
+  snprintf(decTime, sizeof(decTime), ".%lu", ms10);
+
+  // Calcul lățime: main = 5 caractere @ Size 3 (90px), dec = 2 caractere @ Size 2 (24px)
+  // Lățime totală = 114px. Spațiu centrare = (128 - 114) / 2 = 7px.
+  int tx = 7;
+  int ty = 22; // Poziția pe axa Y
+
+  // Printează Minutele și Secundele URIAȘ
+  oled.setTextSize(3);
+  oled.setCursor(tx, ty);
+  oled.print(mainTime);
+
+  // Printează Zecimile de secundă mai mici, aliniate jos
+  oled.setTextSize(2);
+  oled.setCursor(tx + 90, ty + 7); // Coborât 7 pixeli pentru aliniere perfectă la bază
+  oled.print(decTime);
+
+  // ==========================================
+  // INDICATOR VIZUAL DE STARE (HUD ICONS)
+  // ==========================================
+  if (gTimerRunning) {
+    // Punct care clipește la jumătate de secundă
+    if ((millis() / 500) % 2 == 0) {
+      oled.fillCircle(120, 26, 3, SSD1306_WHITE); 
     }
-    
-    return;
+  } else if (!gTimerRunning && currentElapsed > 0) {
+    // Iconiță de PAUZĂ (două bare verticale)
+    oled.fillRect(117, 24, 2, 6, SSD1306_WHITE);
+    oled.fillRect(121, 24, 2, 6, SSD1306_WHITE);
   }
 
-  // === ONLINE MODE: Show WiFi status ===
-  drawTitleBar("RETEA + MQTT");
+  // ==========================================
+  // BOTTOM BAR: Ora locală & Status
+  // ==========================================
+  oled.drawLine(0, 48, 128, 48, SSD1306_WHITE); // Linie separatoare elegantă
 
   oled.setTextSize(1);
-  oled.setCursor(0, 18); oled.printf("SSID: %s", WiFi.SSID().c_str());
-  oled.setCursor(0, 28); oled.printf("IP:   %s", WiFi.localIP().toString().c_str());
-  oled.setCursor(0, 38); oled.printf("RSSI: %d dBm", gRSSI);
-  oled.setCursor(0, 48); oled.printf("Data: %.10s", strlen(gTimestamp) >= 10 ? gTimestamp : "----------");
-  oled.setCursor(0, 58); oled.printf("MQTT:%s", mqtt.connected() ? "OK" : "Off");
-
-  int bars = 0;
-  if (WiFi.status() == WL_CONNECTED) {
-    bars = constrain((gRSSI + 100) / 10, 0, 4);
-  }
-  for (int i = 0; i < 4; i++) {
-    int bh = 4 + i * 3;
-    int by = 54 - bh;
-    int bx = 100 + i * 7;
-    if (i < bars) oled.fillRect(bx, by, 5, bh, SSD1306_WHITE);
-    else          oled.drawRect(bx, by, 5, bh, SSD1306_WHITE);
-  }
-}
-
-static void pageCPU() {
-  drawTitleBar("INC. CPU");
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%d", (int)roundf(gCpuLoad));
-  int numW = strlen(buf) * 18;
-  int sx = (128 - numW - 14) / 2;
-  if (sx < 0) sx = 0;
-  oled.setTextSize(3); oled.setCursor(sx, 18); oled.print(buf);
-  oled.setTextSize(2); oled.setCursor(sx + numW + 2, 22); oled.print("%");
-  drawProgressBar(4, 48, 120, 8, gCpuLoad);
-}
-
-static void pageVoltage() {
-  drawTitleBar("TENSIUNE");
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.2f", gVoltage);
-  int numW = strlen(buf) * 18;
-  int sx = (128 - numW - 14) / 2;
-  if (sx < 0) sx = 0;
-  oled.setTextSize(3); oled.setCursor(sx, 18); oled.print(buf);
-  oled.setTextSize(2); oled.setCursor(sx + numW + 2, 22); oled.print("V");
-  char pow[20];
-  snprintf(pow, sizeof(pow), "Put: %.0f mW", gPowerMW);
-  drawCentered(pow, 42, 1);
-  float pct = constrain((gVoltage - 3.0f) / 1.2f * 100.0f, 0, 100);
-  drawProgressBar(4, 52, 120, 8, pct);
-}
-
-static void pageCurrent() {
-  drawTitleBar("CURENT");
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%.0f mA", gCurrentMA);
-  drawCentered(buf, 18, 2);
-  char total[22];
-  snprintf(total, sizeof(total), "CP: %.2f mAh", gBatteryPresent ? gTotalMAh : 0.0f);
-  drawCentered(total, 38, 1);
-  char pow[20];
-  snprintf(pow, sizeof(pow), "Put: %.0f mW", gPowerMW);
-  drawCentered(pow, 48, 1);
-}
-
-static void pageBattery() {
-  drawTitleBar("BATERIE");
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.0f", gBattPct);
-  int numW = strlen(buf) * 18;
-  int sx = (128 - numW - 14) / 2;
-  if (sx < 0) sx = 0;
-  oled.setTextSize(3); oled.setCursor(sx, 18); oled.print(buf);
-  oled.setTextSize(2); oled.setCursor(sx + numW + 2, 22); oled.print("%");
-  oled.setTextSize(1);
-  if (gBatteryPresent && gBattLife > 0) {
-    int hrs = (int)gBattLife / 60;
-    int mins = (int)gBattLife % 60;
-    char est[20];
-    snprintf(est, sizeof(est), "Est: %dh %dm", hrs, mins);
-    drawCentered(est, 40, 1);
-  } else if (!gBatteryPresent) {
-    drawCentered("Est: -- (fara bat)", 40, 1);
+  
+  // Stânga: Status text
+  oled.setCursor(2, 54);
+  if (gTimerRunning) {
+    oled.print("ACTIVE");
+  } else if (currentElapsed == 0) {
+    oled.print("READY");
   } else {
-    drawCentered("Est: -- (fara sarc)", 40, 1);
+    oled.print("PAUSED");
   }
-  char used[24];
-  snprintf(used, sizeof(used), "CP: %.2f mAh", gBatteryPresent ? gTotalMAh : 0.0f);
-  drawCentered(used, 50, 1);
+
+  // Dreapta: Ora locală (Informație secundară)
+  char timeStr[9] = "--:--:--";
+  if (strlen(gTimestamp) >= 19) {
+    memcpy(timeStr, gTimestamp + 11, 8);
+    timeStr[8] = '\0';
+  }
+  
+  int lx = 128 - (8 * 6) - 2; // Aliniat la marginea din dreapta
+  oled.setCursor(lx, 54);
+  oled.print(timeStr);
+}
+static void pageCPU() {
+  drawTitleBar("SYSTEM CORE");
+  
+  // Massive centered percentage
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%d%%", (int)roundf(gCpuLoad));
+  
+  oled.setTextSize(3);
+  int offset = (128 - strlen(buf) * 18) / 2;
+  oled.setCursor(max(0, offset), 18);
+  oled.print(buf);
+
+  // CPU Load Bar (Visual indicator)
+  float pct = constrain(gCpuLoad, 0.0f, 100.0f);
+  oled.drawRect(14, 44, 100, 6, SSD1306_WHITE);
+  oled.fillRect(16, 46, (int)(pct / 100.0f * 96), 2, SSD1306_WHITE);
+
+  // Status texts spread out cleanly on the bottom
+  oled.setTextSize(1);
+  oled.setCursor(0, 54);
+  oled.printf("Up: %lus", (unsigned long)gUptime);
+  
+  oled.setCursor(72, 54);
+  oled.printf("Str: %s", moduleCpuStress ? "ON" : "OFF");
 }
 
 static void pageRawLog() {
-  bool summaryView = ((millis() / 5000UL) % 2UL) == 1UL;
+  drawTitleBar("TELEMETRY");
 
-  if (summaryView) drawTitleBar("RAW SUMMARY");
-  else             drawTitleBar("RAW EVENTS");
+  // Declumped by shifting Y coords down slightly and dropping one unneeded stat
+  oled.setTextSize(1);
+  oled.setCursor(8, 20); 
+  oled.printf("Therm ADC : %4u", gThermRaw);
+  oled.setCursor(8, 32); 
+  oled.printf("Gyro X Raw: %6d", gGyroRawX);
+  oled.setCursor(8, 44); 
+  oled.printf("Gyro Y Raw: %6d", gGyroRawY);
+  oled.setCursor(8, 56); 
+  oled.printf("Gyro Z Raw: %6d", gGyroRawZ);
+}
+
+static void pageTemp() {
+  drawTitleBar("TEMPERATURE");
+  
+  // Custom large thermometer icon for this specific page
+  // Scaled from -20C to +40C for realistic skydive visual fill
+  float visualHeat = constrain((gTemp + 20.0f) / 60.0f * 100.0f, 0, 100); 
+  int tx = 10, ty = 20;
+  oled.drawRoundRect(tx, ty, 10, 32, 4, SSD1306_WHITE); // Glass tube
+  oled.fillCircle(tx + 4, ty + 34, 7, SSD1306_WHITE);  // Bulb
+  int fillH = (int)(visualHeat / 100.0f * 26.0f);
+  if (fillH > 0) {
+    oled.fillRect(tx + 2, ty + 30 - fillH, 6, fillH, SSD1306_WHITE); // Mercury
+  }
+
+  // Split-typography formatting
+  int wholeC = (int)gTemp;
+  int decC = (int)(abs(gTemp) * 10) % 10; // Get first decimal digit
+  
+  // Print giant whole number
+  oled.setTextSize(3);
+  char wBuf[6]; 
+  snprintf(wBuf, sizeof(wBuf), "%d", wholeC);
+  int wLen = strlen(wBuf) * 18;
+  oled.setCursor(38, 28);
+  oled.print(wBuf);
+  
+  // Print smaller decimal right next to it (baseline aligned)
+  oled.setTextSize(2);
+  oled.setCursor(38 + wLen, 35); 
+  oled.printf(".%d", decC);
+  
+  // Print Degree C symbol perfectly spaced
+  oled.drawCircle(38 + wLen + 26, 28, 3, SSD1306_WHITE); 
+  oled.setCursor(38 + wLen + 32, 28);
+  oled.print("C");
+}
+
+static void pageGyro() {
+  drawTitleBar("ATTITUDE HUD");
+  
+  // Center Gauge (Moved down safely away from title/yaw)
+  drawArtificialHorizon(64, 42, 20, gPitch, gRoll);
+  
+  // Top Center: Magnetic/Yaw Heading
+  char yBuf[16]; 
+  snprintf(yBuf, sizeof(yBuf), "HDG: %03.0f", gYaw);
+  drawCentered(yBuf, 16, 1);
+  
+  // ==========================================
+  // LEFT EDGE: Pitch Vertical Slider
+  // ==========================================
+  oled.drawRect(0, 22, 5, 40, SSD1306_WHITE); // Track
+  // Map Pitch (-90 to +90) into the physical slider space (Y: 22 to 62)
+  int pY = 42 - (int)(constrain(gPitch, -90.0f, 90.0f) / 90.0f * 18.0f);
+  oled.fillRect(0, pY - 2, 8, 5, SSD1306_WHITE); // Moving cursor block
+  
+  oled.setTextSize(1);
+  oled.setCursor(10, 32); oled.print("P");
+  oled.setCursor(10, 42); oled.printf("%.0f", gPitch);
+
+  // ==========================================
+  // RIGHT EDGE: Roll Vertical Slider
+  // ==========================================
+  oled.drawRect(123, 22, 5, 40, SSD1306_WHITE); // Track
+  // Map Roll (-180 to +180) into the physical slider space
+  int rY = 42 - (int)(constrain(gRoll, -180.0f, 180.0f) / 180.0f * 18.0f);
+  oled.fillRect(120, rY - 2, 8, 5, SSD1306_WHITE); // Moving cursor block
+  
+  // Text pushed inward so it doesn't get cut off
+  int rightX = 94; 
+  if (gRoll <= -100 || gRoll >= 100) rightX = 88; // Shift left if 3 digits
+  oled.setCursor(114, 32); oled.print("R");
+  oled.setCursor(rightX, 42); oled.printf("%.0f", gRoll);
+}
+static void pageWiFi() {
+  drawTitleBar("BLUETOOTH LINK");
 
   oled.setTextSize(1);
+  if (bleConnected) {
+    // Massive centered Bluetooth rune
+    int bx = 58; int by = 22;
+    oled.drawLine(bx + 6, by, bx + 6, by + 18, SSD1306_WHITE); 
+    oled.drawLine(bx + 6, by, bx + 12, by + 4, SSD1306_WHITE); 
+    oled.drawLine(bx + 12, by + 4, bx, by + 13, SSD1306_WHITE); 
+    oled.drawLine(bx + 6, by + 18, bx + 12, by + 13, SSD1306_WHITE); 
+    oled.drawLine(bx + 12, by + 13, bx, by + 4, SSD1306_WHITE); 
+    
+    drawCentered("CONNECTED", 48, 1);
+    drawCentered("Streaming Telemetry", 56, 1);
+  } else {
+    // Giant X to show broken connection
+    oled.drawLine(44, 20, 84, 40, SSD1306_WHITE);
+    oled.drawLine(44, 21, 84, 41, SSD1306_WHITE); // Double thickness
+    
+    oled.drawLine(84, 20, 44, 40, SSD1306_WHITE);
+    oled.drawLine(84, 21, 44, 41, SSD1306_WHITE); // Double thickness
 
-  if (summaryView) {
-    int gpioHigh = 0;
-    for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
-      int state = digitalRead(GPIO_PUBLISH_PINS[i]);
-      if (state) gpioHigh++;
-    }
-
-    oled.setCursor(0, 18); oled.printf("THM RAW:%4u", gThermRaw);
-    oled.setCursor(0, 27); oled.printf("GYR X:%5d", gGyroRawX);
-    oled.setCursor(0, 36); oled.printf("GYR Y:%5d", gGyroRawY);
-    oled.setCursor(0, 45); oled.printf("GYR Z:%5d", gGyroRawZ);
-    oled.setCursor(0, 54); oled.printf("GPIO HIGH:%2d/%2d", gpioHigh, (int)GPIO_PUBLISH_PIN_COUNT);
-    return;
+    drawCentered("DISCONNECTED", 48, 1);
+    drawCentered("Check Phone App", 56, 1);
   }
+}
+static void pageVoltage() {
+  drawTitleBar("POWER (VOLTS)");
+  
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%.2f", gVoltage);
+  int numW = strlen(buf) * 18;
+  int sx = max(0, (128 - numW - 14) / 2);
+  
+  oled.setTextSize(3); oled.setCursor(sx, 22); oled.print(buf);
+  oled.setTextSize(2); oled.setCursor(sx + numW + 4, 28); oled.print("V");
 
-  if (!gOledLogHasData) {
-    drawCentered("Astept evenimente...", 28, 1);
-    return;
-  }
+  // Gauge line from 3.0V (empty) to 4.2V (full)
+  float pct = constrain((gVoltage - 3.0f) / 1.2f * 100.0f, 0, 100);
+  oled.drawRect(14, 54, 100, 6, SSD1306_WHITE);
+  oled.fillRect(16, 56, (int)(pct / 100.0f * 96), 2, SSD1306_WHITE);
+}
 
-  for (uint8_t row = 0; row < OLED_LOG_LINES; row++) {
-    uint8_t idx = (gOledLogHead + row) % OLED_LOG_LINES;
-    oled.setCursor(0, 18 + row * 9);
-    if (row == OLED_LOG_LINES - 1) oled.print('>');
-    else oled.print(' ');
-    oled.print(gOledLog[idx]);
-  }
+static void pageCurrent() {
+  drawTitleBar("POWER (AMPS)");
+  
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.0f", gCurrentMA);
+  int numW = strlen(buf) * 18;
+  int sx = max(0, (128 - numW - 24) / 2);
+
+  oled.setTextSize(3); oled.setCursor(sx, 22); oled.print(buf);
+  oled.setTextSize(2); oled.setCursor(sx + numW + 4, 28); oled.print("mA");
+
+  oled.setTextSize(1);
+  char pow[24];
+  snprintf(pow, sizeof(pow), "Draw: %.0f mW", gPowerMW);
+  drawCentered(pow, 54, 1);
+}
+
+static void pageBattery() {
+  drawTitleBar("BATTERY CELL");
+  
+  drawDynamicBattery(34, 18, 60, 24, gBattPct);
+
+  // Put percentage inside the massive battery block if we can, or just below
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%.0f%%", gBattPct);
+  drawCentered(buf, 48, 2);
 }
 
 static void pageI2CScanner() {
-  drawTitleBar("I2C SCAN");
+  drawTitleBar("I2C DIAGNOSTICS");
   oled.setTextSize(1);
 
-  oled.setCursor(0, 18);
   if (gI2cFoundCount == 0) {
-    oled.print("No devices found");
-    oled.setCursor(0, 28);
-    oled.print("Check SDA/SCL/wiring");
+    drawCentered("BUS DEAD / MISO", 32, 1);
     return;
   }
 
-  oled.printf("Found: %u", gI2cFoundCount);
-  if (gI2cScanOverflow) {
-    oled.print("+");
-  }
-
-  const uint8_t startY = 28;
-  const uint8_t lineH = 9;
   const uint8_t maxRows = 4;
-
   const uint8_t totalPages = (gI2cFoundCount + maxRows - 1) / maxRows;
   const uint8_t pageIdx = (totalPages > 1) ? (uint8_t)((millis() / 2000UL) % totalPages) : 0;
   const uint8_t firstIndex = pageIdx * maxRows;
-
-  if (totalPages > 1) {
-    oled.setCursor(88, 18);
-    oled.printf("%u/%u", pageIdx + 1, totalPages);
-  }
 
   for (uint8_t i = 0; i < maxRows; i++) {
     const uint8_t idx = firstIndex + i;
     if (idx >= gI2cFoundCount) break;
     const uint8_t addr = gI2cFound[idx];
-    oled.setCursor(0, startY + i * lineH);
-    oled.printf("0x%02X %-8s", addr, i2cDeviceName(addr));
+    oled.setCursor(12, 18 + i * 11);
+    oled.printf("[-] 0x%02X %s", addr, i2cDeviceName(addr));
   }
 }
 
@@ -2770,17 +2845,16 @@ static void drawPage() {
     case 0: pageDashboard(); break;
     case 1: pageTemp();      break;
     case 2: pageGyro();      break;
-    case 3: pageWiFi();      break;
+    case 3: pageWiFi();      break; 
     case 4: pageCPU();       break;
     case 5: pageVoltage();   break;
     case 6: pageCurrent();   break;
     case 7: pageBattery();   break;
     case 8: pageRawLog();    break;
     case 9: pageI2CScanner(); break;
+    case 10: pageRTC();      break; // <--- ADD THIS LINE
   }
-
-  oled.display();
-}
+  oled.display();}
 
 // ================================================================
 // SETUP
@@ -2788,7 +2862,7 @@ static void drawPage() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== Hard&Soft Task 1 — MQTT Monitor ===\n");
+  Serial.println("\n=== Hard&Soft Task 3 — Skydiver Monitor (BLE-Only) ===\n");
 
   // --- I2C at 100kHz (DS1307-compatible) ---
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -2903,100 +2977,81 @@ analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 
     Serial.println();
   }
 
-  // --- WiFi ---
-  isrNextFlag = false;
-  isrPrevFlag = false;
-  gAllowWifiSkipDuringConnect = true;
-  bool wifiOk = connectWiFiFromList();
-  gAllowWifiSkipDuringConnect = false;
-  gIgnoreButtonsUntilMs = millis() + 700;
-
-  if (wifiOk) {
-    syncClockFromNtp();
-    gWasWifiConnected = true;
-    Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
-    if (hasOLED) {
+  
+  // --- BLE (Bluetooth Low Energy) ---
+  Serial.println("[BLE] Initializing BLE communication...");
+  initBLE();
+  
+  // =======================================================
+  // BOOT ANIMATION & BLE PAIRING WAIT
+  // =======================================================
+  if (hasOLED) {
+    int radius = 0;
+    
+    // Block execution and play radar animation until a device connects
+    while (!bleConnected) {
       oled.clearDisplay();
-      oled.setCursor(0, 0);
-      oled.println("WiFi OK");
-      oled.println(WiFi.localIP().toString());
-      oled.println("\nMQTT: broker.emqx.io");
+      
+      // Inverted header
+      oled.fillRect(0, 0, 128, 14, SSD1306_WHITE);
+      oled.setTextColor(SSD1306_BLACK);
+      oled.setTextSize(1);
+      int tx = (128 - 11 * 6) / 2;
+      oled.setCursor(max(0, tx), 3);
+      oled.print("BLE PAIRING");
+      oled.setTextColor(SSD1306_WHITE);
+
+      // Radar pulse effect
+      oled.drawCircle(64, 32, 6 + radius, SSD1306_WHITE);
+      if (radius > 8) oled.drawCircle(64, 32, radius - 8, SSD1306_WHITE);
+      
+      // Center Bluetooth Rune
+      oled.drawLine(64, 26, 64, 38, SSD1306_WHITE);
+      oled.drawLine(64, 26, 68, 29, SSD1306_WHITE);
+      oled.drawLine(68, 29, 60, 35, SSD1306_WHITE);
+      oled.drawLine(64, 38, 68, 35, SSD1306_WHITE);
+      oled.drawLine(68, 35, 60, 29, SSD1306_WHITE);
+
+      // Blinking text
+      if ((millis() / 500) % 2 == 0) {
+        int w = 18 * 6; // "Waiting for App..." is 18 chars
+        oled.setCursor((128 - w) / 2, 54);
+        oled.print("Waiting for App...");
+      }
+      
       oled.display();
+      
+      radius++;
+      if (radius > 20) radius = 0; // Reset animation loop
+      
+      delay(40); // Yield to ESP32 background tasks (prevents watchdog crash)
     }
-  } else {
-    Serial.println("[WiFi] FAILED — offline mode");
-    startOfflineServices();
+
+    // SUCCESS ANIMATION (Flashes screen inverted)
+    oled.clearDisplay();
+    oled.fillRect(0, 0, 128, 64, SSD1306_WHITE); // Full white screen
+    oled.setTextColor(SSD1306_BLACK);
+    
+    oled.setTextSize(2);
+    int lx = (128 - 4 * 12) / 2; // "LINK"
+    oled.setCursor(lx, 16);
+    oled.print("LINK");
+    
+    oled.setTextSize(1);
+    int ex = (128 - 11 * 6) / 2; // "ESTABLISHED"
+    oled.setCursor(ex, 38);
+    oled.print("ESTABLISHED");
+    
+    oled.display();
+    oled.setTextColor(SSD1306_WHITE); // Reset text color for main loop
+    delay(1500); // Hold success screen for 1.5s
   }
-
-  // --- MQTT ---
-  mqttClientId = "esp32-hs-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setCallback(onMqttMessage);
-  mqtt.setBufferSize(2048);
-  connectMqtt();
-
-  loadBatteryState();
-
-  imuWs.begin();
-  imuWs.onEvent(onImuWebSocketEvent);
-  Serial.printf("[IMU-WS] Listening on ws://%s:%u\n", WiFi.localIP().toString().c_str(), IMU_WS_PORT);
-
-  for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
-    gGpioLastState[i] = -1;
-  }
-
-  lastOtherSensorRead = millis();
-  lastImuPublishMs = millis();
-  lastEnergy = millis();
-  gLastBattPersistMs = millis();
-
-  delay(1500);
-  cpuLastIdleHookCount = cpuIdleHookCount;
-  Serial.println("\n[READY] Loop starting\n");
 }
 
 // ================================================================
 // LOOP — minimal: only react to flags, no polling
 // ================================================================
 void loop() {
-  updateConnectivityMode();
-
-  if (WiFi.status() != WL_CONNECTED && millis() - gLastWifiReconnectAttemptMs >= WIFI_RETRY_INTERVAL_MS) {
-    // Punem flagurile pe false
-    isrNextFlag = false;
-    isrPrevFlag = false;
-    gAllowWifiSkipDuringConnect = true;
-
-    Serial.println("[WiFi] Reconnect attempt...");
-    if (connectWiFiFromList()) {
-      Serial.printf("[WiFi] Reconnected: %s\n", WiFi.localIP().toString().c_str());
-      syncClockFromNtp();
-      gWasWifiConnected = true;
-    }
-    
-    gAllowWifiSkipDuringConnect = false;
-    
-    // FIX 4: Resetează timer-ul AICI, DUPĂ ce s-a terminat încercarea de conectare!
-    // Altfel, va intra într-o buclă infinită de reconectare și va bloca toți senzorii.
-    gLastWifiReconnectAttemptMs = millis(); 
-  }
-
-  imuWs.loop();
-
-  if (gLocalBrokerStarted) {
-    localBroker.update();
-  }
-
-  // MQTT keepalive (PubSubClient needs frequent calls)
-  mqtt.loop();
-
-  // MQTT reconnect (non-blocking, every 5s)
-  static uint32_t lastMqttRetry = 0;
-  if (!mqtt.connected() && millis() - lastMqttRetry > 5000) {
-    lastMqttRetry = millis();
-    connectMqtt();
-  }
-
   // Buttons (ISR-driven, just check flags)
   handleButtons();
 
@@ -3022,58 +3077,26 @@ void loop() {
     gLastGyroReadMs = millis();
   }
 
-  // FAST IMU publish for frontend rendering.
-  if (hasGyro && moduleGyro && gImuWsClientCount > 0 && (millis() - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
+  // FAST IMU publish via BLE (when connected).
+  if (hasGyro && moduleGyro && bleConnected && (millis() - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
     lastImuPublishMs = millis();
-
-    char imuJson[768];
-    size_t imuLen = buildImuJSON(imuJson, sizeof(imuJson));
-    if (imuLen > 0 && imuLen < sizeof(imuJson)) {
-      imuWs.broadcastTXT(imuJson);
-    } else {
-      Serial.println("[IMU-WS] Payload too large or empty");
-    }
+    publishIMUDataBLE();
   }
 
-  if (hasGyro && moduleGyro && gImuWsClientCount == 0 && (millis() - lastImuPublishMs >= IMU_PUBLISH_IDLE_INTERVAL_MS)) {
+  if (hasGyro && moduleGyro && !bleConnected && (millis() - lastImuPublishMs >= IMU_PUBLISH_IDLE_INTERVAL_MS)) {
     lastImuPublishMs = millis();
   }
 
-  // SLOW: Other sensors (1Hz) + MQTT publish
+  // SLOW: Other sensors (1Hz) + BLE publish
   if (millis() - lastOtherSensorRead >= 1000) {
     lastOtherSensorRead = millis();
 
-    readOtherSensors();  // Read temp, current, time, cpu, wifi
+    readOtherSensors();  // Read temp, current, time, cpu
 
-    // MQTT publish (1Hz)
-    if (mqtt.connected()) {
-      char json[1024];
-      size_t jsonLen = buildJSON(json, sizeof(json));
-      if (jsonLen >= sizeof(json)) {
-        Serial.printf("[MQTT] DATA JSON truncated (%u >= %u)\n", (unsigned)jsonLen, (unsigned)sizeof(json));
-      } else {
-        mqtt.publish(MQTT_TOPIC, json);
-      }
-
-      char rawJson[1536];
-      size_t rawLen = buildRawGpioJSON(rawJson, sizeof(rawJson));
-      if (rawLen >= sizeof(rawJson)) {
-        Serial.printf("[MQTT] RAW JSON truncated (%u >= %u)\n", (unsigned)rawLen, (unsigned)sizeof(rawJson));
-      } else {
-        mqtt.publish(MQTT_RAW_TOPIC, rawJson);
-      }
-    } else if (gLocalBrokerStarted && gOfflineServicesActive) {
-      char json[1024];
-      size_t jsonLen = buildJSON(json, sizeof(json));
-      if (jsonLen < sizeof(json)) {
-        localBroker.publish(std::string(MQTT_TOPIC), std::string(json));
-      }
-
-      char rawJson[1536];
-      size_t rawLen = buildRawGpioJSON(rawJson, sizeof(rawJson));
-      if (rawLen < sizeof(rawJson)) {
-        localBroker.publish(std::string(MQTT_RAW_TOPIC), std::string(rawJson));
-      }
+    // BLE publish (1Hz when connected)
+    if (bleConnected) {
+      publishSensorDataBLE();
+      publishIMUDataBLE();
     }
 
     drawPage();
@@ -3088,5 +3111,23 @@ void loop() {
     scanI2cDevices();
   }
 
-  delay(2);  // Reduced from 10ms since we're not blocking on sensor reads
+  // Update BLE connection state for OLED display
+// Update BLE connection state for OLED display
+  if (oldBleConnected != bleConnected) {
+    oldBleConnected = bleConnected;
+    if (bleConnected) {
+      Serial.println("[BLE] Client connected");
+    } else {
+      Serial.println("[BLE] Client disconnected");
+      
+      // Auto-switch to the Bluetooth page so the user sees the giant X immediately
+      page = 3; 
+      drawPage();
+    }
+  }
+// Force rapid screen redraw ONLY if we are looking at the running timer
+  if (hasOLED && page == 10 && gTimerRunning) {
+    drawPage();
+  }
+  delay(2);  // Small delay to yield to other tasks
 }
