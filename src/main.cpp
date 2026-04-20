@@ -11,7 +11,7 @@
  *   - DS1307 RTC module HW-111    (I2C 0x68)
  *   - 10k NTC thermistor divider on GPIO0 (ADC)
  *   - LSM6DS3-compatible gyro      (I2C 0x6A)
- *   - MPU9250 IMU with AK8963 mag  (I2C 0x68/0x69)
+ *   - MPU9250/MPU6500 IMU          (I2C 0x68/0x69)
  *   - MAX30102 (Blood Oxygen/HR)   (I2C 0x57)
  *   - LG INR18650MH1 battery      (3.6V nom, 3200mAh)
  *   - 2x tactile push buttons
@@ -22,10 +22,10 @@
  *
  * WIRING:
  *   I2C Bus:
- *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3, MAX30102, AK8963
- *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3, MAX30102, AK8963
+ *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3, MAX30102
+ *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3, MAX30102
  *   Thermistor divider:
- *     3.3V -> 10k resistor -> GPIO0 -> 10k NTC -> GND
+ *     3.3V -> 10k NTC -> GPIO0 -> 10k resistor -> GND
  *   Buttons (active LOW, internal pull-up):
  *     ESP32 GPIO3 --> Button NEXT --> GND
  *     ESP32 GPIO4 --> Button PREV --> GND
@@ -80,11 +80,16 @@ static const float BATT_CURRENT_DEADBAND_MA = 5.0f;
 static const char* PREF_NS = "battery";
 static const char* PREF_KEY_USED_MAH = "used_mAh";
 
-///// BLE SENSOR PUBLISHING INTERVALS /////
-static const uint32_t IMU_PUBLISH_INTERVAL_MS = 100;       // 100ms when BLE connected (~10 Hz)
+// =============================================================================
+// BLE publishing cadence
+// =============================================================================
+static const uint32_t IMU_PUBLISH_INTERVAL_MS = 20;        // 20ms when BLE connected (50 Hz)
 static const uint32_t IMU_PUBLISH_IDLE_INTERVAL_MS = 5000; // 5s when BLE not connected (saves power)
+static const uint32_t SENSOR_PUBLISH_INTERVAL_MS = 250;    // 4 Hz for smoother slow-parameter updates
 
-///// PIN MAP /////
+// =============================================================================
+// Hardware pin map
+// =============================================================================
 static const uint8_t I2C_SDA   = 8;
 static const uint8_t I2C_SCL   = 9;
 static const uint8_t BTN_NEXT  = 3;
@@ -96,17 +101,21 @@ static const uint8_t GYRO_INT  = 10;  // MPU9250/6500 data ready interrupt pin
 static const uint8_t GPIO_PUBLISH_PINS[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21};
 static const size_t GPIO_PUBLISH_PIN_COUNT = sizeof(GPIO_PUBLISH_PINS) / sizeof(GPIO_PUBLISH_PINS[0]);
 
-///// I2C AND ANALOG /////
+// =============================================================================
+// I2C + ADC
+// =============================================================================
 static const uint32_t I2C_FREQ      = 100000;  // 100kHz — safe for DS1307
 static const uint8_t THERM_PIN      = 0;       // GPIO0: divider midpoint
 static const float ADC_MAX          = 4095.0f; // ESP32-C3 12-bit ADC
 
-///// NTC THERMISTOR MODEL /////
-// Circuit: 3.3V -> 10k fixed -> ADC(GPIO0) -> 10k NTC -> GND
+// =============================================================================
+// Thermistor model and filtering
+// =============================================================================
+// Circuit: 3.3V -> 10k NTC -> ADC(GPIO0) -> 10k fixed -> GND
 static const float R_FIXED   = 10000.0f;
 static const float R_NOMINAL = 10000.0f;  // 10k NTC @ 25°C
 static const float T_NOMINAL = 25.0f;
-static const float B_COEFF   = 3470.0f;   // Standard NTC B coefficient
+static const float B_COEFF   = 3950.0f;   // Standard NTC B coefficient
 static const float THERM_ADC_REF_V = 3.3f;       // kept for open/short conversion; voltage read via analogReadMilliVolts()
 static const bool THERM_SUPPLY_IS_VBAT = false;    // Divider is powered from 3.3V rail; do not use INA/VBAT for NTC conversion
 static const float THERM_SUPPLY_FALLBACK_V = 3.3f; // used when THERM_SUPPLY_IS_VBAT=true and live VBAT is unavailable
@@ -118,12 +127,14 @@ static const uint8_t THERM_SAMPLE_COUNT = 17;         // Odd count for median se
 static const uint16_t THERM_SAMPLE_DELAY_US = 500;    // 0.5 ms between ADC reads
 static const uint16_t THERM_TRIM_WINDOW_MV = 45;      // Keep samples close to median
 // FIXED topology - do NOT auto-detect
-// Circuit: 3.3V -> R_FIXED(10k) -> ADC -> NTC(to GND) -> GND
-static const bool THERM_NTC_TO_GND = true;
+// Circuit: 3.3V -> NTC -> ADC -> R_FIXED(10k) -> GND
+static const bool THERM_NTC_TO_GND = false;
 static const float THERM_CAL_GAIN = 1.0f;
 static const float THERM_CAL_OFFSET_C = 0.0f;
 
-///// IMU AND MAGNETOMETER /////
+// =============================================================================
+// IMU registers and fusion tuning
+// =============================================================================
 // IMU support:
 // - LSM6DS3/compatible at 0x6A
 // - MPU6500/MPU9250 at 0x68 or 0x69 (AD0 strap dependent)
@@ -151,15 +162,6 @@ static const uint8_t MPU_INT_PIN_CFG = 0x37;  // Interrupt pin configuration reg
 static const uint8_t MPU_INT_ENABLE = 0x38;   // Interrupt enable register
 static const uint8_t MPU_INT_STATUS = 0x3A;   // Interrupt status register (clear by reading)
 
-// AK8963 magnetometer inside MPU9250 (not present on MPU6500)
-static const uint8_t AK8963_ADDR = 0x0C;
-static const uint8_t AK8963_WHO_AM_I = 0x00;
-static const uint8_t AK8963_ST1 = 0x02;
-static const uint8_t AK8963_XOUT_L = 0x03;
-static const uint8_t AK8963_CNTL1 = 0x0A;
-static const uint8_t AK8963_ASAX = 0x10;
-static const uint8_t AK8963_WHO_AM_I_VAL = 0x48;
-
 static const uint8_t RTC_ADDR_DS1307 = 0x68;
 static const uint8_t RTC_ADDR_ALT = 0x60;
 
@@ -182,14 +184,8 @@ static const float ZUPT_VEL_DECAY = 0.02f;
 static const float ZUPT_POS_HOLD_ALPHA = 0.002f;
 static const float STATIONARY_WORLD_ACC_G = 0.08f;
 
-// Kalman orientation fusion constants (gyro + accel) and yaw correction with mag.
-static const float KALMAN_Q_ANGLE = 0.001f;
-static const float KALMAN_Q_BIAS = 0.003f;
-static const float KALMAN_R_MEASURE = 0.03f;
-static const float YAW_MAG_BLEND_MIN = 0.03f;
-static const float YAW_MAG_BLEND_MAX = 0.14f;
+// Quaternion fusion constants (gyro + accel).
 static const float QUAT_ACC_GAIN = 1.8f;
-static const float QUAT_MAG_GAIN = 1.4f;
 
 static const uint8_t OLED_TITLE_H = 16;
 static const uint8_t OLED_TITLE_TEXT_Y = 4;
@@ -198,13 +194,17 @@ static const signed char orientationDefault[9] = {0, 1, 0, 0, 0, 1, 1, 0, 0};
 // Keep fallback to register fusion if DMP init fails.
 #define USE_MPU_DMP 0
 
-///// DISPLAY AND TIMING /////
+// =============================================================================
+// Display and UI timing
+// =============================================================================
 static const uint8_t  SCREEN_W      = 128;
 static const uint8_t  SCREEN_H      = 64;
 static const uint8_t  NUM_PAGES     = 11;
 static const uint16_t DEBOUNCE_MS   = 200;
 
-///// GLOBAL OBJECTS /////
+// =============================================================================
+// Global objects
+// =============================================================================
 static Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
 static Adafruit_INA219  ina;
 static RTC_DS1307       rtc;
@@ -212,17 +212,19 @@ static Thermistor       thermistor(R_NOMINAL, R_FIXED, B_COEFF, 12, 3.3, 298.15)
 static Preferences      prefs;
 static MPU9250_DMP      mpu;
 
-///// BLE STATE /////
+// =============================================================================
+// BLE/runtime state
+// =============================================================================
 static bool oldBleConnected = false;
 
-///// DEVICE STATUS FLAGS /////
+// Device presence flags
 static bool hasOLED   = false;
 static bool hasINA219 = false;
 static bool hasRTC    = false;
 static bool hasGyro   = false;
 static uint8_t gRtcAddr = 0;
 
-///// SENSOR DATA /////
+// Sensor and fusion state
 static float    gTemp       = 0.0f;
 static uint16_t gThermRaw   = 0;
 static bool     gThermValid = false;
@@ -250,13 +252,6 @@ static uint8_t  gGyroStillCount = 0;
 static float    gAccelX     = 0.0f;
 static float    gAccelY     = 0.0f;
 static float    gAccelZ     = 0.0f;
-static bool     gHasMag     = false;
-static int16_t  gMagRawX    = 0;
-static int16_t  gMagRawY    = 0;
-static int16_t  gMagRawZ    = 0;
-static float    gMagX       = 0.0f;
-static float    gMagY       = 0.0f;
-static float    gMagZ       = 0.0f;
 static float    gRoll       = 0.0f;
 static float    gPitch      = 0.0f;
 static float    gYaw        = 0.0f;
@@ -288,11 +283,8 @@ static bool     gMotionAnchorValid = false;
 static float    gMotionAnchorX = 0.0f;
 static float    gMotionAnchorY = 0.0f;
 static float    gMotionAnchorZ = 0.0f;
-static uint32_t gLastMagReadMs = 0;
-static float    gMagAdjX    = 1.0f;
-static float    gMagAdjY    = 1.0f;
-static float    gMagAdjZ    = 1.0f;
 static uint8_t  gImuAddr    = 0;
+static uint8_t  gImuWhoAmI  = 0;
 static bool     gImuIsMpu   = false;
 static int16_t  gRSSI       = 0;
 static float    gVoltage    = 0.0f;
@@ -309,7 +301,9 @@ static char     gTimestamp[20] = "0000-00-00 00:00:00";
 static uint32_t gUptime     = 0;
 static bool     gBatteryPresent = true;
 
-///// INTERNAL STATE /////
+// =============================================================================
+// Internal state
+// =============================================================================
 static volatile int8_t page = 0;
 static uint32_t lastEnergy  = 0;
 // Mission Timer State
@@ -354,12 +348,12 @@ static uint8_t gI2cFoundCount = 0;
 static bool gI2cScanOverflow = false;
 static uint32_t gLastI2cScanMs = 0;
 
-///// SENSOR READ TIMERS /////
+// Periodic task timers
 static uint32_t lastSensorRead = 0;    // Other sensors: 1Hz
 static uint32_t lastOtherSensorRead = 0;
 static uint32_t lastImuPublishMs = 0;
 
-///// INTERRUPT FLAGS /////
+// Interrupt hand-off flags
 static volatile bool isrNextFlag = false;
 static volatile bool isrPrevFlag = false;
 
@@ -368,27 +362,18 @@ static volatile uint16_t gyroDataReadyCount = 0;
 static uint32_t gLastGyroReadMs = 0;
 static uint32_t gIgnoreButtonsUntilMs = 0;
 static bool gMpuDmpActive = false;
+static uint32_t gLastImuSummaryMs = 0;
 
-///// MODULE TOGGLES /////
+// Module enable switches
 static bool moduleTemp    = true;
 static bool moduleGyro    = true;
 static bool moduleCPU     = true;
 static bool moduleCurrent = true;
 static volatile bool moduleCpuStress = false;
 
-struct KalmanAxis {
-  float angle;
-  float bias;
-  float P00;
-  float P01;
-  float P10;
-  float P11;
-};
-
-static KalmanAxis gKalRoll = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
-static KalmanAxis gKalPitch = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
-
-///// FORWARD DECLARATIONS /////
+// =============================================================================
+// Forward declarations
+// =============================================================================
 static void publishState();
 static void drawPage();
 static float measureCpuLoadPct();
@@ -412,10 +397,24 @@ static bool rtcWriteDateTime(int year, int month, int day, int hour, int minute,
 static bool rtcReadDateTime(int& year, int& month, int& day, int& hour, int& minute, int& second);
 static bool thermistorTempFromRatio(float adcRatio, bool ntcToGnd, float& tempC);
 static bool thermistorTempFromResistance(float rNtc, float r25, float& tempC);
-static bool readMagnetometer();
-static float kalmanUpdateAxis(KalmanAxis& k, float measuredAngle, float measuredRate, float dt);
 static void updateOrientationFusion(float dt, float gx, float gy, float gz, float ax, float ay, float az);
 static void handleBleCommand(const String& cmd);
+static void configureI2cAndAdc();
+static void initCpuLoadSubsystem();
+static void initButtonInterrupts();
+static void scanAndPrintI2cMap();
+static void initOledDisplay();
+static void initIna219Sensor();
+static void initRtcClock();
+static void initGyroSubsystem();
+static void initBleSubsystem();
+static void processGyroFastPath();
+static void publishImuFastIfDue();
+static void runOneHzTasks();
+static void refreshI2cScanCacheIfDue();
+static void updateBleConnectionUiState();
+static void refreshRunningTimerPage();
+
 
 #include "sensors/sensor_mpu_fusion.cpp"
 
@@ -441,7 +440,9 @@ static void syncClockFromNtp() {
 
 // WebSocket handler removed - now using BLE notifications instead
 
-///// INTERRUPT SERVICE ROUTINES /////
+// =============================================================================
+// ISRs
+// =============================================================================
 void IRAM_ATTR isrBtnNext() { isrNextFlag = true; }
 void IRAM_ATTR isrBtnPrev() { isrPrevFlag = true; }
 void IRAM_ATTR isrGyroDataReady() {
@@ -450,12 +451,14 @@ void IRAM_ATTR isrGyroDataReady() {
   }
 }  // MPU data ready interrupt
 
-///// THERMISTOR AND I2C HELPERS /////
+// Sensor implementation units included in composed build.
 #include "sensors/sensor_ntc.cpp"
 #include "sensors/sensor_mpu_driver.cpp"
 #include "sensors/sensor_rtc.cpp"
 
-///// I2C BUS PROBE /////
+// =============================================================================
+// Local helpers
+// =============================================================================
 static bool i2cProbe(uint8_t addr) {
   Wire.beginTransmission(addr);
   return (Wire.endTransmission() == 0);
@@ -464,7 +467,9 @@ static bool i2cProbe(uint8_t addr) {
 #include "sensors/sensor_ina219.cpp"
 #include "utils/sensor_polling_utils.cpp"
 
-///// BLE COMMAND HANDLER /////
+// =============================================================================
+// BLE command handling
+// =============================================================================
 
 static void handleBleCommand(const String& cmd) {
   if (cmd == "START") {
@@ -487,9 +492,9 @@ static void handleBleCommand(const String& cmd) {
 }
 
 
-///// SENSOR POLLING + JSON BUILDERS /////
-
-///// STATE PUBLISHING /////
+// =============================================================================
+// State publishing
+// =============================================================================
 // BLE replaces the old MQTT publish path; publishing happens from loop().
 
 static void publishState() {
@@ -497,23 +502,23 @@ static void publishState() {
   Serial.println("[BLE] Module state updated");
 }
 
-///// BUTTON HANDLING /////
+// OLED page renderer implementation unit.
 #include "sensors/sensor_oled.cpp"
 
-///// APPLICATION SETUP /////
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("\n=== Hard&Soft Task 3 — Skydiver Monitor (BLE-Only) ===\n");
-
-  // --- I2C at 100kHz (DS1307-compatible) ---
+// =============================================================================
+// Setup/loop decomposition helpers
+// =============================================================================
+static void configureI2cAndAdc() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(I2C_FREQ);
   Wire.setTimeOut(50);
 
-analogReadResolution(12);
-analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 3.3V!
-  // --- CPU load hook (fallback when runtime stats are unavailable) ---
+  analogReadResolution(12);
+  // ADC_11db extends measurable range close to 3.3V for the thermistor divider.
+  analogSetPinAttenuation(THERM_PIN, ADC_11db);
+}
+
+static void initCpuLoadSubsystem() {
   bool idleHookOk = false;
 #if CONFIG_FREERTOS_NUMBER_OF_CORES == 1
   idleHookOk = esp_register_freertos_idle_hook(cpuIdleHook);
@@ -524,6 +529,7 @@ analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 
   if (!idleHookOk) {
     Serial.println("[CPU] Idle hook not available, using runtime stats/0%");
   }
+
   cpuLastIdleHookCount = cpuIdleHookCount;
   cpuPrevIdleHookCount = cpuIdleHookCount;
   cpuLastLoadSampleMs = millis();
@@ -532,19 +538,16 @@ analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 
   if (xTaskCreate(cpuStressTask, "cpu_stress", 3072, nullptr, 1, nullptr) != pdPASS) {
     Serial.println("[CPU] Stress task create FAILED");
   }
+}
 
-  // --- Buttons (interrupt-driven) ---
+static void initButtonInterrupts() {
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
-  // Attach early so skip can work during initial Wi-Fi connection.
   attachInterrupt(digitalPinToInterrupt(BTN_NEXT), isrBtnNext, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_PREV), isrBtnPrev, FALLING);
+}
 
-  // --- Gyroscope INT pin (data ready interrupt) ---
-  pinMode(GYRO_INT, INPUT_PULLUP);  // Robust for boards where INT behaves open-drain/floating
-  // NOTE: Interrupt attached after initGyro() since we need to know if MPU is present
-
-  // --- I2C scan ---
+static void scanAndPrintI2cMap() {
   Serial.println("[I2C] Scan (100kHz):");
   scanI2cDevices();
   for (uint8_t i = 0; i < gI2cFoundCount; i++) {
@@ -555,8 +558,9 @@ analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 
     Serial.println("  ... more devices (list truncated)");
   }
   Serial.println();
+}
 
-  // --- OLED ---
+static void initOledDisplay() {
   hasOLED = i2cProbe(0x3C);
   if (hasOLED) {
     hasOLED = oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -570,22 +574,28 @@ analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 
     }
   }
   Serial.printf("[OLED]   %s\n", hasOLED ? "OK" : "MISSING");
+}
 
-  // --- INA219 (16V, 400mA range — better resolution for battery monitoring) ---
+static void initIna219Sensor() {
   hasINA219 = i2cProbe(0x40);
   if (hasINA219) {
     hasINA219 = ina.begin();
     if (hasINA219) {
-      ina.setCalibration_16V_400mA();  // <-- KEY FIX: proper calibration
+      ina.setCalibration_16V_400mA();
     }
   }
+
   loadBatteryState();
   Serial.printf("[INA219] %s\n", hasINA219 ? "OK (16V/400mA)" : "MISSING");
+}
 
-  // --- RTC ---
+static void initRtcClock() {
   gRtcAddr = 0;
-  if (i2cProbe(RTC_ADDR_DS1307)) gRtcAddr = RTC_ADDR_DS1307;
-  else if (i2cProbe(RTC_ADDR_ALT)) gRtcAddr = RTC_ADDR_ALT;
+  if (i2cProbe(RTC_ADDR_DS1307)) {
+    gRtcAddr = RTC_ADDR_DS1307;
+  } else if (i2cProbe(RTC_ADDR_ALT)) {
+    gRtcAddr = RTC_ADDR_ALT;
+  }
 
   hasRTC = (gRtcAddr != 0);
   if (hasRTC && gRtcAddr == RTC_ADDR_DS1307) {
@@ -601,65 +611,79 @@ analogSetPinAttenuation(THERM_PIN, ADC_11db); // FIX: Permite citirea până la 
   } else {
     Serial.printf("[RTC]    MISSING\n");
   }
+}
 
-  // --- Gyroscope ---
+static void initGyroSubsystem() {
+  pinMode(GYRO_INT, INPUT_PULLUP);
+
   hasGyro = initGyro();
-  if (!hasGyro) moduleGyro = false;
-  Serial.printf("[GYRO]   %s", hasGyro ? "OK" : "MISSING/UNKNOWN");
-  if (hasGyro) {
-    Serial.printf(" @0x%02X %s\n", gImuAddr, gImuIsMpu ? "(MPU6500/9250)" : "(LSM6DS3)");
-    // Attach interrupt for data-ready if MPU is present
-    if (gImuIsMpu) {
-      attachInterrupt(digitalPinToInterrupt(GYRO_INT), isrGyroDataReady,
-                      gMpuDmpActive ? FALLING : RISING);
-      Serial.printf("[GYRO-INT] Attached to GPIO%u (data ready interrupt)\n", GYRO_INT);
-      Serial.printf("[GYRO]   MPU mode: %s\n", gMpuDmpActive ? "DMP quaternion" : "register fusion");
-    }
-    Serial.printf("[MAG]    %s\n", gHasMag ? "AK8963 detected" : "Not present");
-  } else {
-    Serial.println();
+  if (!hasGyro) {
+    moduleGyro = false;
   }
 
-  
-  // --- BLE (Bluetooth Low Energy) ---
+  Serial.printf("[GYRO]   %s", hasGyro ? "OK" : "MISSING/UNKNOWN");
+  if (!hasGyro) {
+    Serial.println();
+    return;
+  }
+
+  Serial.printf(" @0x%02X %s\n", gImuAddr, gImuIsMpu ? "(MPU6500/9250)" : "(LSM6DS3)");
+  if (gImuIsMpu) {
+    const char* modelName = (gImuWhoAmI == MPU_WHO_AM_I_9250) ? "MPU9250" :
+                            (gImuWhoAmI == MPU_WHO_AM_I_6500) ? "MPU6500" : "MPU-unknown";
+    Serial.printf("[IMU]    WHO_AM_I=0x%02X -> %s\n", gImuWhoAmI, modelName);
+
+    attachInterrupt(digitalPinToInterrupt(GYRO_INT), isrGyroDataReady, gMpuDmpActive ? FALLING : RISING);
+    Serial.printf("[GYRO-INT] Attached to GPIO%u (data ready interrupt)\n", GYRO_INT);
+    Serial.printf("[GYRO]   MPU mode: %s\n", gMpuDmpActive ? "DMP quaternion" : "register fusion");
+  } else {
+    Serial.printf("[IMU]    WHO_AM_I=0x%02X\n", gImuWhoAmI);
+  }
+}
+
+static void initBleSubsystem() {
   Serial.println("[BLE] Initializing BLE communication...");
   BleManager::setCommandHandler(handleBleCommand);
   BleManager::init();
-  
-  ///// BOOT ANIMATION AND BLE PAIRING WAIT /////
-  runOledBlePairingAnimation();
 }
 
-///// MAIN LOOP /////
-void loop() {
-  // Buttons (ISR-driven, just check flags)
-  handleButtons();
-
-  // FAST: Gyroscope via interrupt (GPIO10 INT pin), drain a few queued events per loop.
-  if (hasGyro && moduleGyro) {
-    uint16_t pending = 0;
-    noInterrupts();
-    pending = gyroDataReadyCount;
-    gyroDataReadyCount = 0;
-    interrupts();
-
-    if (pending > 3) pending = 3;  // avoid starving the rest of the loop
-
-    while (pending--) {
-      (void)readGyro();  // Fast, non-blocking gyro read only
-      gLastGyroReadMs = millis();
-    }
+static void processGyroFastPath() {
+  if (!hasGyro || !moduleGyro) {
+    return;
   }
 
-  // Fallback: if INT wiring/signal is missing, keep gyro alive via light polling.
-  if (hasGyro && moduleGyro && (millis() - gLastGyroReadMs >= 20)) {
+  uint16_t pending = 0;
+  noInterrupts();
+  pending = gyroDataReadyCount;
+  gyroDataReadyCount = 0;
+  interrupts();
+
+  if (pending > 3) {
+    pending = 3;
+  }
+
+  while (pending--) {
     (void)readGyro();
     gLastGyroReadMs = millis();
   }
 
-  // FAST IMU publish via BLE (when connected).
-  if (hasGyro && moduleGyro && BleManager::isConnected() && (millis() - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
-    lastImuPublishMs = millis();
+  // Fallback polling path in case the interrupt line is missing/unreliable.
+  if (millis() - gLastGyroReadMs >= 20) {
+    (void)readGyro();
+    gLastGyroReadMs = millis();
+  }
+}
+
+static void publishImuFastIfDue() {
+  if (!hasGyro || !moduleGyro) {
+    return;
+  }
+
+  const bool connected = BleManager::isConnected();
+  const uint32_t nowMs = millis();
+
+  if (connected && (nowMs - lastImuPublishMs >= IMU_PUBLISH_INTERVAL_MS)) {
+    lastImuPublishMs = nowMs;
     BleManager::publishImuData({
       gUptime,
       gQuat0,
@@ -670,94 +694,150 @@ void loop() {
       gPitch,
       gYaw,
       gMotionStillCount,
-      ZUPT_STILL_REQUIRED_SAMPLES
+      ZUPT_STILL_REQUIRED_SAMPLES,
+      gAccelX,
+      gAccelY,
+      gAccelZ,
+      gGyroX,
+      gGyroY,
+      gGyroZ
+    });
+    return;
+  }
+
+  if (!connected && (nowMs - lastImuPublishMs >= IMU_PUBLISH_IDLE_INTERVAL_MS)) {
+    lastImuPublishMs = nowMs;
+  }
+}
+
+static void runOneHzTasks() {
+  if (millis() - lastOtherSensorRead < SENSOR_PUBLISH_INTERVAL_MS) {
+    return;
+  }
+
+  lastOtherSensorRead = millis();
+  readOtherSensors();
+
+  if (BleManager::isConnected()) {
+    BleManager::publishSensorData({
+      gTimestamp,
+      gUptime,
+      moduleTemp,
+      gThermValid,
+      gTemp,
+      moduleGyro,
+      hasGyro,
+      gGyroX,
+      gGyroY,
+      gGyroZ,
+      gRoll,
+      gPitch,
+      gYaw,
+      gQuat0,
+      gQuat1,
+      gQuat2,
+      gQuat3,
+      gMotionStillCount,
+      ZUPT_STILL_REQUIRED_SAMPLES,
+      moduleCurrent,
+      gVoltage,
+      gCurrentMA,
+      gBattPct,
+      moduleCPU,
+      gCpuLoad
+    });
+
+    BleManager::publishImuData({
+      gUptime,
+      gQuat0,
+      gQuat1,
+      gQuat2,
+      gQuat3,
+      gRoll,
+      gPitch,
+      gYaw,
+      gMotionStillCount,
+      ZUPT_STILL_REQUIRED_SAMPLES,
+      gAccelX,
+      gAccelY,
+      gAccelZ,
+      gGyroX,
+      gGyroY,
+      gGyroZ
     });
   }
 
-  if (hasGyro && moduleGyro && !BleManager::isConnected() && (millis() - lastImuPublishMs >= IMU_PUBLISH_IDLE_INTERVAL_MS)) {
-    lastImuPublishMs = millis();
-  }
+  drawPage();
 
-  // SLOW: Other sensors (1Hz) + BLE publish
-  if (millis() - lastOtherSensorRead >= 1000) {
-    lastOtherSensorRead = millis();
+  Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
+                gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
+}
 
-    readOtherSensors();  // Read temp, current, time, cpu
-
-    // BLE publish (1Hz when connected)
-    if (BleManager::isConnected()) {
-      BleManager::publishSensorData({
-        gTimestamp,
-        gUptime,
-        moduleTemp,
-        gThermValid,
-        gTemp,
-        moduleGyro,
-        hasGyro,
-        gGyroX,
-        gGyroY,
-        gGyroZ,
-        gRoll,
-        gPitch,
-        gYaw,
-        gQuat0,
-        gQuat1,
-        gQuat2,
-        gQuat3,
-        gMotionStillCount,
-        ZUPT_STILL_REQUIRED_SAMPLES,
-        moduleCurrent,
-        gVoltage,
-        gCurrentMA,
-        gBattPct,
-        moduleCPU,
-        gCpuLoad
-      });
-
-      BleManager::publishImuData({
-        gUptime,
-        gQuat0,
-        gQuat1,
-        gQuat2,
-        gQuat3,
-        gRoll,
-        gPitch,
-        gYaw,
-        gMotionStillCount,
-        ZUPT_STILL_REQUIRED_SAMPLES
-      });
-    }
-
-    drawPage();
-
-    // Serial log
-    Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
-      gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
-  }
-
-  // Refresh scanner data in background for the dedicated OLED I2C page.
+static void refreshI2cScanCacheIfDue() {
   if (millis() - gLastI2cScanMs >= 3000) {
     scanI2cDevices();
   }
+}
 
-  // Update BLE connection state for OLED display
-// Update BLE connection state for OLED display
-  bool bleConnected = BleManager::isConnected();
-  if (oldBleConnected != bleConnected) {
-    oldBleConnected = bleConnected;
-    if (bleConnected) {
-      Serial.println("[BLE] Client connected");
-    } else {
-      Serial.println("[BLE] Client disconnected");
-      
-      // Auto-switch to the Bluetooth page so the user sees the giant X immediately
-      page = 3; 
-      drawPage();
-    }
+static void updateBleConnectionUiState() {
+  const bool bleConnected = BleManager::isConnected();
+  if (oldBleConnected == bleConnected) {
+    return;
   }
-// Force rapid screen redraw ONLY if we are looking at the running timer
+
+  oldBleConnected = bleConnected;
+  if (bleConnected) {
+    Serial.println("[BLE] Client connected");
+    return;
+  }
+
+  Serial.println("[BLE] Client disconnected");
+  page = 3;
+  drawPage();
+}
+
+static void refreshRunningTimerPage() {
   if (hasOLED && page == 10 && gTimerRunning) {
     drawPage();
   }
+}
+
+
+
+// =============================================================================
+// Arduino lifecycle
+// =============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== Hard&Soft Task 3 — Skydiver Monitor (BLE-Only) ===\n");
+
+  configureI2cAndAdc();
+  initCpuLoadSubsystem();
+  initButtonInterrupts();
+  scanAndPrintI2cMap();
+  initOledDisplay();
+  initIna219Sensor();
+  initRtcClock();
+  initGyroSubsystem();
+
+  initBleSubsystem();
+  
+  // Run splash/pairing UX after peripherals and BLE are initialized.
+  runOledBlePairingAnimation();
+}
+
+void loop() {
+  handleButtons();
+
+  processGyroFastPath();
+  publishImuFastIfDue();
+  runOneHzTasks();
+  refreshI2cScanCacheIfDue();
+  updateBleConnectionUiState();
+  refreshRunningTimerPage();
+
+
+
   delay(2);  // Small delay to yield to other tasks
 }

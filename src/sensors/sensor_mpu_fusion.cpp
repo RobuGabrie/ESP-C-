@@ -1,9 +1,3 @@
-static float wrapAngle180(float a) {
-  while (a > 180.0f) a -= 360.0f;
-  while (a < -180.0f) a += 360.0f;
-  return a;
-}
-
 static float normalize360(float a) {
   while (a >= 360.0f) a -= 360.0f;
   while (a < 0.0f) a += 360.0f;
@@ -150,33 +144,6 @@ static void updateInertialBiases(bool stationary, float axMeas, float ayMeas, fl
   }
 }
 
-static float kalmanUpdateAxis(KalmanAxis& k, float measuredAngle, float measuredRate, float dt) {
-  float rate = measuredRate - k.bias;
-  k.angle += dt * rate;
-
-  k.P00 += dt * (dt * k.P11 - k.P01 - k.P10 + KALMAN_Q_ANGLE);
-  k.P01 -= dt * k.P11;
-  k.P10 -= dt * k.P11;
-  k.P11 += KALMAN_Q_BIAS * dt;
-
-  float S = k.P00 + KALMAN_R_MEASURE;
-  float K0 = k.P00 / S;
-  float K1 = k.P10 / S;
-
-  float y = measuredAngle - k.angle;
-  k.angle += K0 * y;
-  k.bias += K1 * y;
-
-  float P00_temp = k.P00;
-  float P01_temp = k.P01;
-  k.P00 -= K0 * P00_temp;
-  k.P01 -= K0 * P01_temp;
-  k.P10 -= K1 * P00_temp;
-  k.P11 -= K1 * P01_temp;
-
-  return k.angle;
-}
-
 static void updateOrientationFusion(float dt, float gx, float gy, float gz, float ax, float ay, float az) {
   const float DEG_TO_RAD_F = 0.0174532925f;
   float wx = gx * DEG_TO_RAD_F;
@@ -265,42 +232,5 @@ static void updateOrientationFusion(float dt, float gx, float gy, float gz, floa
   gQuat3 = q3;
 
   updateEulerFromQuaternion();
-
-  if (gHasMag) {
-    float rollRad = gRoll * DEG_TO_RAD_F;
-    float pitchRad = gPitch * DEG_TO_RAD_F;
-    float mxComp = gMagX * cosf(pitchRad) + gMagZ * sinf(pitchRad);
-    float myComp = gMagX * sinf(rollRad) * sinf(pitchRad) + gMagY * cosf(rollRad) - gMagZ * sinf(rollRad) * cosf(pitchRad);
-    gHeading = normalize360(atan2f(myComp, mxComp) * 57.29578f);
-
-    float yawErr = wrapAngle180(gHeading - gYaw);
-    float absRate = sqrtf(gx * gx + gy * gy + gz * gz);
-    float dynamicBlend = YAW_MAG_BLEND_MAX;
-    if (absRate > 220.0f) {
-      dynamicBlend = YAW_MAG_BLEND_MIN;
-    } else if (absRate > 0.0f) {
-      float t = absRate / 220.0f;
-      dynamicBlend = YAW_MAG_BLEND_MAX - (YAW_MAG_BLEND_MAX - YAW_MAG_BLEND_MIN) * t;
-    }
-    float yawCorr = (dynamicBlend + QUAT_MAG_GAIN * 0.01f) * yawErr;
-
-    float halfYaw = 0.5f * yawCorr * DEG_TO_RAD_F;
-    float cq = cosf(halfYaw);
-    float sq = sinf(halfYaw);
-    float nq0 = q0 * cq - q3 * sq;
-    float nq1 = q1 * cq - q2 * sq;
-    float nq2 = q2 * cq + q1 * sq;
-    float nq3 = q3 * cq + q0 * sq;
-
-    float nNorm = sqrtf(nq0 * nq0 + nq1 * nq1 + nq2 * nq2 + nq3 * nq3);
-    if (nNorm > 1e-6f) {
-      gQuat0 = nq0 / nNorm;
-      gQuat1 = nq1 / nNorm;
-      gQuat2 = nq2 / nNorm;
-      gQuat3 = nq3 / nNorm;
-      updateEulerFromQuaternion();
-    }
-  } else {
-    gHeading = gYaw;
-  }
+  gHeading = gYaw;
 }

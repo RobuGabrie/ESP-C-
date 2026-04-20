@@ -1,87 +1,241 @@
 #include "ble_manager.h"
 
-#include <ArduinoJson.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 namespace {
 
-static constexpr const char* BLE_DEVICE_NAME = "Skydiver-Monitor";
-static constexpr const char* SERVICE_UUID = "180D";
-static constexpr const char* CHAR_TEMPERATURE_UUID = "2A1C";
-static constexpr const char* CHAR_GYRO_UUID = "2A4E";
-static constexpr const char* CHAR_BATTERY_UUID = "2A19";
-static constexpr const char* CHARACTERISTIC_NOTIFY_UUID = "a0000001-1000-1000-8000-00805f9b34fb";
-static constexpr const char* CHARACTERISTIC_IMU_UUID = "a0000002-1000-1000-8000-00805f9b34fb";
+static constexpr const char* BLE_DEVICE_NAME = "skywatch.";
+static constexpr const char* SERVICE_UUID = "12345678-1234-1234-1234-123456789abc";
+static constexpr const char* FAST_CHAR_UUID = "12345678-1234-1234-1234-123456789001";
+static constexpr const char* SLOW_CHAR_UUID = "12345678-1234-1234-1234-123456789002";
+static constexpr const char* COMMAND_CHAR_UUID = "12345678-1234-1234-1234-123456789003";
+static constexpr uint32_t FAST_NOTIFY_INTERVAL_MS = 20;   // 50 Hz
+static constexpr uint32_t SLOW_NOTIFY_INTERVAL_MS = 250;  // 4 Hz
 
-BLEServer* gBleServer = nullptr;
-BLEService* gService = nullptr;
-BLECharacteristic* gCharSensorData = nullptr;
-BLECharacteristic* gCharTemperature = nullptr;
-BLECharacteristic* gCharGyro = nullptr;
-BLECharacteristic* gCharBattery = nullptr;
-BLECharacteristic* gCharIMU = nullptr;
+NimBLEServer* gBleServer = nullptr;
+NimBLEService* gService = nullptr;
+NimBLECharacteristic* gFastChar = nullptr;
+NimBLECharacteristic* gSlowChar = nullptr;
+NimBLECharacteristic* gCommandChar = nullptr;
 
 bool gBleConnected = false;
 uint32_t gBleSensorNotifyCount = 0;
 uint32_t gBleImuNotifyCount = 0;
-uint32_t gBleImuSkipLogMs = 0;
 BleManager::CommandHandler gCommandHandler = nullptr;
+TaskHandle_t gFastTaskHandle = nullptr;
+TaskHandle_t gSlowTaskHandle = nullptr;
+portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
+BleManager::FastPacket gFastPacket = {};
+BleManager::SlowPacket gSlowPacket = {};
+uint8_t gFastSeq = 0;
+uint8_t gSlowSeq = 0;
+bool gFastPrimed = false;
+bool gSlowPrimed = false;
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* server) override {
-    (void)server;
+static float clampf(float v, float lo, float hi) {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+static int16_t toInt16Scaled(float value, float scale, float lo, float hi) {
+  const float clamped = clampf(value * scale, lo, hi);
+  return static_cast<int16_t>(lroundf(clamped));
+}
+
+static uint16_t toUint16Scaled(float value, float scale, float lo, float hi) {
+  const float clamped = clampf(value * scale, lo, hi);
+  return static_cast<uint16_t>(lroundf(clamped));
+}
+
+static uint8_t toUint8Clamped(float value, float lo, float hi) {
+  const float clamped = clampf(value, lo, hi);
+  return static_cast<uint8_t>(lroundf(clamped));
+}
+
+static void parseTimestamp(const char* ts,
+                           uint16_t& year,
+                           uint8_t& month,
+                           uint8_t& day,
+                           uint8_t& hour,
+                           uint8_t& minute,
+                           uint8_t& second) {
+  year = 0;
+  month = 0;
+  day = 0;
+  hour = 0;
+  minute = 0;
+  second = 0;
+
+  if (ts == nullptr) {
+    return;
+  }
+
+  int y = 0;
+  int mo = 0;
+  int d = 0;
+  int h = 0;
+  int mi = 0;
+  int s = 0;
+  const int parsed = sscanf(ts, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s);
+  if (parsed != 6) {
+    return;
+  }
+
+  year = static_cast<uint16_t>(clampf(static_cast<float>(y), 0.0f, 65535.0f));
+  month = static_cast<uint8_t>(clampf(static_cast<float>(mo), 0.0f, 12.0f));
+  day = static_cast<uint8_t>(clampf(static_cast<float>(d), 0.0f, 31.0f));
+  hour = static_cast<uint8_t>(clampf(static_cast<float>(h), 0.0f, 23.0f));
+  minute = static_cast<uint8_t>(clampf(static_cast<float>(mi), 0.0f, 59.0f));
+  second = static_cast<uint8_t>(clampf(static_cast<float>(s), 0.0f, 59.0f));
+}
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
     gBleConnected = true;
+    // Ask for a low-latency link right after connect (7.5-15 ms interval).
+    server->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 200);
     Serial.println("[BLE] Client connected");
   }
 
-  void onDisconnect(BLEServer* server) override {
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+    (void)connInfo;
+    (void)reason;
     gBleConnected = false;
     Serial.println("[BLE] Client disconnected");
-    server->startAdvertising();
+    NimBLEDevice::startAdvertising();
   }
 };
 
-class CharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    std::string rxValue = characteristic->getValue();
-    if (rxValue.empty()) {
+static void fastNotifyTask(void* pv) {
+  (void)pv;
+  TickType_t xLastWake = xTaskGetTickCount();
+
+  while (true) {
+    BleManager::FastPacket packetCopy;
+    bool canSend = false;
+
+    portENTER_CRITICAL(&gPacketMux);
+    packetCopy = gFastPacket;
+    canSend = gFastPrimed;
+    portEXIT_CRITICAL(&gPacketMux);
+
+    if (canSend && gBleConnected && gFastChar != nullptr) {
+      gFastChar->setValue(reinterpret_cast<uint8_t*>(&packetCopy), sizeof(packetCopy));
+      gFastChar->notify();
+      gBleImuNotifyCount++;
+
+      if ((gBleImuNotifyCount % 40) == 0) {
+        Serial.printf("[BLE] FAST notify #%lu, %u bytes\n",
+                      static_cast<unsigned long>(gBleImuNotifyCount),
+                      static_cast<unsigned>(sizeof(packetCopy)));
+      }
+    }
+
+    vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(FAST_NOTIFY_INTERVAL_MS));
+  }
+}
+
+static void slowNotifyTask(void* pv) {
+  (void)pv;
+
+  while (true) {
+    BleManager::SlowPacket packetCopy;
+    bool canSend = false;
+
+    portENTER_CRITICAL(&gPacketMux);
+    packetCopy = gSlowPacket;
+    canSend = gSlowPrimed;
+    portEXIT_CRITICAL(&gPacketMux);
+
+    if (canSend && gBleConnected && gSlowChar != nullptr) {
+      gSlowChar->setValue(reinterpret_cast<uint8_t*>(&packetCopy), sizeof(packetCopy));
+      gSlowChar->notify();
+      gBleSensorNotifyCount++;
+
+      if ((gBleSensorNotifyCount % 10) == 0) {
+        Serial.printf("[BLE] SLOW notify #%lu, %u bytes\n",
+                      static_cast<unsigned long>(gBleSensorNotifyCount),
+                      static_cast<unsigned>(sizeof(packetCopy)));
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(SLOW_NOTIFY_INTERVAL_MS));
+  }
+}
+
+static uint8_t buildSlowFlags(const BleManager::SensorData& data) {
+  uint8_t flags = 0;
+  if (data.thermValid) {
+    flags |= 0x01;
+  }
+  if (data.moduleGyro && data.hasGyro) {
+    flags |= 0x02;
+  }
+  if (data.moduleCurrent) {
+    flags |= 0x04;
+  }
+  if (data.moduleCPU) {
+    flags |= 0x08;
+  }
+  if (data.motionStillCount >= data.zuptStillRequiredSamples) {
+    flags |= 0x10;
+  }
+  if (gBleConnected) {
+    flags |= 0x20;
+  }
+  return flags;
+}
+
+static String normalizeBleCommand(const std::string& raw) {
+  String out;
+  out.reserve(raw.size());
+
+  for (char c : raw) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (uc == 0) {
+      continue;
+    }
+    out += static_cast<char>(std::toupper(uc));
+  }
+
+  out.trim();
+  return out;
+}
+
+class CommandCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+
+    if (characteristic == nullptr || gCommandHandler == nullptr) {
       return;
     }
 
-    Serial.printf("[BLE] Received %d bytes: ", (int)rxValue.length());
-    String cmd;
-    cmd.reserve(rxValue.length());
-    for (size_t i = 0; i < rxValue.length(); i++) {
-      cmd += rxValue[i];
+    const std::string raw = characteristic->getValue();
+    const String cmd = normalizeBleCommand(raw);
+    if (cmd.length() == 0) {
+      return;
     }
-    Serial.println(cmd);
 
-    cmd.trim();
-    cmd.toUpperCase();
-    if (gCommandHandler != nullptr) {
+    if (cmd == "START" || cmd == "STOP" || cmd == "RESET") {
+      Serial.printf("[BLE] Command received: %s\n", cmd.c_str());
       gCommandHandler(cmd);
+      return;
     }
+
+    Serial.printf("[BLE] Ignored unknown command: %s\n", cmd.c_str());
   }
 };
-
-static void normalizeQuat(float& q0, float& q1, float& q2, float& q3) {
-  float n = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  if (n > 1e-6f) {
-    q0 /= n;
-    q1 /= n;
-    q2 /= n;
-    q3 /= n;
-  } else {
-    q0 = 1.0f;
-    q1 = 0.0f;
-    q2 = 0.0f;
-    q3 = 0.0f;
-  }
-}
 
 }  // namespace
 
@@ -92,55 +246,43 @@ void setCommandHandler(CommandHandler handler) {
 }
 
 void init() {
-  Serial.println("[BLE] Initializing BLE...");
+  Serial.println("[BLE] Initializing NimBLE...");
 
-  BLEDevice::setMTU(247);
-  BLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setMTU(247);
 
-  gBleServer = BLEDevice::createServer();
+  gBleServer = NimBLEDevice::createServer();
   gBleServer->setCallbacks(new ServerCallbacks());
 
   gService = gBleServer->createService(SERVICE_UUID);
 
-  gCharSensorData = gService->createCharacteristic(
-    CHARACTERISTIC_NOTIFY_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY |
-      BLECharacteristic::PROPERTY_READ |
-      BLECharacteristic::PROPERTY_WRITE |
-      BLECharacteristic::PROPERTY_WRITE_NR);
-  gCharSensorData->addDescriptor(new BLE2902());
-  gCharSensorData->setCallbacks(new CharacteristicCallbacks());
+  gFastChar = gService->createCharacteristic(FAST_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
+  gSlowChar = gService->createCharacteristic(SLOW_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
+  gCommandChar = gService->createCharacteristic(COMMAND_CHAR_UUID,
+                                                NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
 
-  gCharTemperature = gService->createCharacteristic(
-    CHAR_TEMPERATURE_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
-  gCharTemperature->addDescriptor(new BLE2902());
+  if (gCommandChar != nullptr) {
+    gCommandChar->setCallbacks(new CommandCallbacks());
+  }
 
-  gCharGyro = gService->createCharacteristic(
-    CHAR_GYRO_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
-  gCharGyro->addDescriptor(new BLE2902());
-
-  gCharBattery = gService->createCharacteristic(
-    CHAR_BATTERY_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
-  gCharBattery->addDescriptor(new BLE2902());
-
-  gCharIMU = gService->createCharacteristic(
-    CHARACTERISTIC_IMU_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
-  gCharIMU->addDescriptor(new BLE2902());
-
-  gService->start();
-
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
   advertising->addServiceUUID(SERVICE_UUID);
-  advertising->setScanResponse(true);
-  advertising->setMinPreferred(0x06);
-  advertising->setMaxPreferred(0x12);
-  BLEDevice::startAdvertising();
+  advertising->enableScanResponse(true);
+  advertising->start();
 
-  Serial.printf("[BLE] BLE Advertising started - Device Name: %s\n", BLE_DEVICE_NAME);
+  if (gFastTaskHandle == nullptr) {
+    xTaskCreate(fastNotifyTask, "ble_fast", 3072, nullptr, 2, &gFastTaskHandle);
+  }
+  if (gSlowTaskHandle == nullptr) {
+    xTaskCreate(slowNotifyTask, "ble_slow", 3072, nullptr, 1, &gSlowTaskHandle);
+  }
+
+  if (gCommandHandler != nullptr) {
+    Serial.printf("[BLE] Command characteristic enabled: %s\n", COMMAND_CHAR_UUID);
+  }
+
+  Serial.printf("[BLE] NimBLE advertising started - Device Name: %s\n", BLE_DEVICE_NAME);
 }
 
 bool isConnected() {
@@ -160,147 +302,70 @@ uint32_t imuNotifyCount() {
 }
 
 void publishSensorData(const SensorData& data) {
-  if (!gBleConnected || gCharSensorData == nullptr) {
-    return;
-  }
+  BleManager::SlowPacket pkt = {};
 
-  char buf[384];
-  JsonDocument doc;
-
-  doc["ts"] = data.timestamp;
-  doc["up"] = data.uptime;
+  pkt.uptimeMs = data.uptime;
+  uint16_t rtcYear = 0;
+  uint8_t rtcMonth = 0;
+  uint8_t rtcDay = 0;
+  uint8_t rtcHour = 0;
+  uint8_t rtcMinute = 0;
+  uint8_t rtcSecond = 0;
+  parseTimestamp(data.timestamp, rtcYear, rtcMonth, rtcDay, rtcHour, rtcMinute, rtcSecond);
+  pkt.rtcYear = rtcYear;
+  pkt.rtcMonth = rtcMonth;
+  pkt.rtcDay = rtcDay;
+  pkt.rtcHour = rtcHour;
+  pkt.rtcMinute = rtcMinute;
+  pkt.rtcSecond = rtcSecond;
 
   if (data.moduleTemp && data.thermValid) {
-    doc["temp"] = roundf(data.tempC * 10.0f) / 10.0f;
+    pkt.tempCenti = toInt16Scaled(data.tempC, 100.0f, -32768.0f, 32767.0f);
   }
+  pkt.voltageCenti = toUint16Scaled(data.voltage, 100.0f, 0.0f, 65535.0f);
+  pkt.currentMa = toInt16Scaled(data.currentMA, 1.0f, -32768.0f, 32767.0f);
+  pkt.battPct10 = toUint16Scaled(data.battPct, 10.0f, 0.0f, 1000.0f);
+  pkt.cpuPct10 = toUint16Scaled(data.cpuLoad, 10.0f, 0.0f, 1000.0f);
+  pkt.flags = buildSlowFlags(data);
 
+  portENTER_CRITICAL(&gPacketMux);
+  gSlowSeq++;
+  pkt.seq = gSlowSeq;
+  gSlowPacket = pkt;
+  gSlowPrimed = true;
   if (data.moduleGyro && data.hasGyro) {
-    doc["gx"] = roundf(data.gyroX * 10.0f) / 10.0f;
-    doc["gy"] = roundf(data.gyroY * 10.0f) / 10.0f;
-    doc["gz"] = roundf(data.gyroZ * 10.0f) / 10.0f;
-
-    float q0 = isfinite(data.quat0) ? data.quat0 : 1.0f;
-    float q1 = isfinite(data.quat1) ? data.quat1 : 0.0f;
-    float q2 = isfinite(data.quat2) ? data.quat2 : 0.0f;
-    float q3 = isfinite(data.quat3) ? data.quat3 : 0.0f;
-    normalizeQuat(q0, q1, q2, q3);
-
-    doc["q0"] = roundf(q0 * 10000.0f) / 10000.0f;
-    doc["q1"] = roundf(q1 * 10000.0f) / 10000.0f;
-    doc["q2"] = roundf(q2 * 10000.0f) / 10000.0f;
-    doc["q3"] = roundf(q3 * 10000.0f) / 10000.0f;
-    doc["roll"] = roundf(data.roll * 100.0f) / 100.0f;
-    doc["pitch"] = roundf(data.pitch * 100.0f) / 100.0f;
-    doc["yaw"] = roundf(data.yaw * 100.0f) / 100.0f;
-    doc["stationary"] = (data.motionStillCount >= data.zuptStillRequiredSamples);
-    doc["imu_seq"] = gBleImuNotifyCount;
+    gFastPacket.gxDps10 = toInt16Scaled(data.gyroX, 10.0f, -32768.0f, 32767.0f);
+    gFastPacket.gyDps10 = toInt16Scaled(data.gyroY, 10.0f, -32768.0f, 32767.0f);
+    gFastPacket.gzDps10 = toInt16Scaled(data.gyroZ, 10.0f, -32768.0f, 32767.0f);
   }
-
-  if (data.moduleCurrent) {
-    doc["v"] = roundf(data.voltage * 100.0f) / 100.0f;
-    doc["ma"] = roundf(data.currentMA * 10.0f) / 10.0f;
-    doc["batt"] = roundf(data.battPct * 10.0f) / 10.0f;
-  }
-
-  if (data.moduleCPU) {
-    doc["cpu"] = roundf(data.cpuLoad * 10.0f) / 10.0f;
-  }
-
-  size_t needed = measureJson(doc);
-  if (needed >= sizeof(buf)) {
-    Serial.printf("[BLE] Sensor payload too large: needed=%u, max=%u (drop)\n",
-                  (unsigned)needed,
-                  (unsigned)(sizeof(buf) - 1));
-    return;
-  }
-
-  size_t len = serializeJson(doc, buf, sizeof(buf));
-  if (len != needed) {
-    Serial.printf("[BLE] Sensor serialize mismatch: len=%u needed=%u (drop)\n",
-                  (unsigned)len, (unsigned)needed);
-    return;
-  }
-
-  gCharSensorData->setValue((uint8_t*)buf, len);
-  gCharSensorData->notify();
-  gBleSensorNotifyCount++;
-
-  if (gCharTemperature != nullptr && data.moduleTemp && data.thermValid) {
-    char tbuf[16];
-    int tlen = snprintf(tbuf, sizeof(tbuf), "%.1f", data.tempC);
-    if (tlen > 0) {
-      gCharTemperature->setValue((uint8_t*)tbuf, (size_t)tlen);
-      gCharTemperature->notify();
-    }
-  }
-
-  if (gCharBattery != nullptr) {
-    uint8_t batt = (uint8_t)constrain((int)roundf(data.battPct), 0, 100);
-    gCharBattery->setValue(&batt, 1);
-    gCharBattery->notify();
-  }
-
-  if (gCharGyro != nullptr && data.moduleGyro && data.hasGyro) {
-    float gabs = sqrtf(data.gyroX * data.gyroX + data.gyroY * data.gyroY + data.gyroZ * data.gyroZ);
-    char gbuf[16];
-    int glen = snprintf(gbuf, sizeof(gbuf), "%.1f", gabs);
-    if (glen > 0) {
-      gCharGyro->setValue((uint8_t*)gbuf, (size_t)glen);
-      gCharGyro->notify();
-    }
-  }
-
-  if ((gBleSensorNotifyCount % 10) == 0) {
-    Serial.printf("[BLE] Sensor notify #%lu, len=%u\n",
-                  (unsigned long)gBleSensorNotifyCount,
-                  (unsigned)len);
-  }
+  portEXIT_CRITICAL(&gPacketMux);
 }
 
 void publishImuData(const ImuData& data) {
-  if (!gBleConnected) {
-    return;
-  }
+  BleManager::FastPacket pkt = {};
+  pkt.uptimeMs = data.uptime;
+  pkt.rollCdeg = toInt16Scaled(data.roll, 100.0f, -32768.0f, 32767.0f);
+  pkt.pitchCdeg = toInt16Scaled(data.pitch, 100.0f, -32768.0f, 32767.0f);
+  pkt.yawCdeg = toInt16Scaled(data.yaw, 100.0f, -32768.0f, 32767.0f);
+  pkt.gxDps10 = toInt16Scaled(data.gyroX, 10.0f, -32768.0f, 32767.0f);
+  pkt.gyDps10 = toInt16Scaled(data.gyroY, 10.0f, -32768.0f, 32767.0f);
+  pkt.gzDps10 = toInt16Scaled(data.gyroZ, 10.0f, -32768.0f, 32767.0f);
+  pkt.axMg = toInt16Scaled(data.accelX, 1000.0f, -32768.0f, 32767.0f);
+  pkt.ayMg = toInt16Scaled(data.accelY, 1000.0f, -32768.0f, 32767.0f);
+  pkt.azMg = toInt16Scaled(data.accelZ, 1000.0f, -32768.0f, 32767.0f);
+  pkt.q0e4 = toInt16Scaled(data.quat0, 10000.0f, -32768.0f, 32767.0f);
+  pkt.q1e4 = toInt16Scaled(data.quat1, 10000.0f, -32768.0f, 32767.0f);
+  pkt.q2e4 = toInt16Scaled(data.quat2, 10000.0f, -32768.0f, 32767.0f);
+  pkt.q3e4 = toInt16Scaled(data.quat3, 10000.0f, -32768.0f, 32767.0f);
+  pkt.stationary = (data.motionStillCount >= data.zuptStillRequiredSamples) ? 1 : 0;
+  pkt.stillCount = data.motionStillCount;
 
-  if (gCharIMU == nullptr) {
-    uint32_t now = millis();
-    if (now - gBleImuSkipLogMs >= 3000) {
-      gBleImuSkipLogMs = now;
-      Serial.println("[BLE] IMU notify skipped: pCharIMU is null");
-    }
-    return;
-  }
-
-  char buf[512];
-  JsonDocument doc;
-
-  float q0 = isfinite(data.quat0) ? data.quat0 : 1.0f;
-  float q1 = isfinite(data.quat1) ? data.quat1 : 0.0f;
-  float q2 = isfinite(data.quat2) ? data.quat2 : 0.0f;
-  float q3 = isfinite(data.quat3) ? data.quat3 : 0.0f;
-  normalizeQuat(q0, q1, q2, q3);
-
-  doc["up"] = data.uptime;
-  doc["q0"] = roundf(q0 * 10000.0f) / 10000.0f;
-  doc["q1"] = roundf(q1 * 10000.0f) / 10000.0f;
-  doc["q2"] = roundf(q2 * 10000.0f) / 10000.0f;
-  doc["q3"] = roundf(q3 * 10000.0f) / 10000.0f;
-  doc["roll"] = roundf(data.roll * 100.0f) / 100.0f;
-  doc["pitch"] = roundf(data.pitch * 100.0f) / 100.0f;
-  doc["yaw"] = roundf(data.yaw * 100.0f) / 100.0f;
-  doc["stationary"] = (data.motionStillCount >= data.zuptStillRequiredSamples);
-
-  size_t len = serializeJson(doc, buf, sizeof(buf));
-  if (len < sizeof(buf)) {
-    gCharIMU->setValue((uint8_t*)buf, len);
-    gCharIMU->notify();
-    gBleImuNotifyCount++;
-    if ((gBleImuNotifyCount % 20) == 0) {
-      Serial.printf("[BLE] IMU notify #%lu, len=%u\n",
-                    (unsigned long)gBleImuNotifyCount,
-                    (unsigned)len);
-    }
-  }
+  portENTER_CRITICAL(&gPacketMux);
+  gFastSeq++;
+  pkt.seq = gFastSeq;
+  gFastPacket = pkt;
+  gFastPrimed = true;
+  portEXIT_CRITICAL(&gPacketMux);
 }
 
 }  // namespace BleManager

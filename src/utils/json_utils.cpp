@@ -36,16 +36,6 @@ static size_t buildJSON(char* buf, size_t bufSize) {
     doc["q1"] = roundf(gQuat1 * 10000.0f) / 10000.0f;
     doc["q2"] = roundf(gQuat2 * 10000.0f) / 10000.0f;
     doc["q3"] = roundf(gQuat3 * 10000.0f) / 10000.0f;
-    if (gHasMag) {
-      doc["mx"] = roundf(gMagX * 10.0f) / 10.0f;
-      doc["my"] = roundf(gMagY * 10.0f) / 10.0f;
-      doc["mz"] = roundf(gMagZ * 10.0f) / 10.0f;
-    } else {
-      doc["mx"] = nullptr;
-      doc["my"] = nullptr;
-      doc["mz"] = nullptr;
-    }
-    doc["mag_present"] = gHasMag;
     doc["imu_addr"] = gImuAddr;
   } else {
     doc["gx"] = nullptr;
@@ -63,10 +53,6 @@ static size_t buildJSON(char* buf, size_t bufSize) {
     doc["q1"] = nullptr;
     doc["q2"] = nullptr;
     doc["q3"] = nullptr;
-    doc["mx"] = nullptr;
-    doc["my"] = nullptr;
-    doc["mz"] = nullptr;
-    doc["mag_present"] = false;
     doc["imu_addr"] = nullptr;
   }
 
@@ -216,19 +202,6 @@ static size_t buildRawGpioJSON(char* buf, size_t bufSize) {
     orient["q1"] = nullptr;
     orient["q2"] = nullptr;
     orient["q3"] = nullptr;
-  }
-
-  JsonObject magRaw = doc["mag_raw"].to<JsonObject>();
-  if (moduleGyro && hasGyro && gHasMag) {
-    magRaw["x"] = gMagRawX;
-    magRaw["y"] = gMagRawY;
-    magRaw["z"] = gMagRawZ;
-    magRaw["present"] = true;
-  } else {
-    magRaw["x"] = nullptr;
-    magRaw["y"] = nullptr;
-    magRaw["z"] = nullptr;
-    magRaw["present"] = false;
   }
 
   JsonObject inaRaw = doc["ina219_raw"].to<JsonObject>();

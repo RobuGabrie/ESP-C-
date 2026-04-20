@@ -70,6 +70,7 @@ static bool initGyro() {
 
   if (mpuAddr != 0) {
     if (who == MPU_WHO_AM_I_6500 || who == MPU_WHO_AM_I_9250) {
+      gImuWhoAmI = who;
 #if USE_MPU_DMP
       if (mpu.begin() == INV_SUCCESS) {
         mpu.enableInterrupt();
@@ -81,7 +82,6 @@ static bool initGyro() {
           gImuAddr = mpuAddr;
           gImuIsMpu = true;
           gMpuDmpActive = true;
-          gHasMag = false;
           gGyroFilterSeeded = false;
           gFusionSeeded = false;
           gLastFusionUs = 0;
@@ -105,31 +105,6 @@ static bool initGyro() {
       if (!i2cWriteReg(mpuAddr, MPU_INT_ENABLE, 0x01)) return false;
       (void)calibrateMpuGyroBias(mpuAddr);
 
-      gHasMag = false;
-      uint8_t magWho = 0;
-      if (i2cProbe(AK8963_ADDR) && i2cReadRegs(AK8963_ADDR, AK8963_WHO_AM_I, &magWho, 1) && magWho == AK8963_WHO_AM_I_VAL) {
-        if (i2cWriteReg(AK8963_ADDR, AK8963_CNTL1, 0x00)) {
-          delay(10);
-          if (i2cWriteReg(AK8963_ADDR, AK8963_CNTL1, 0x0F)) {
-            delay(10);
-            uint8_t asa[3] = {0};
-            if (i2cReadRegs(AK8963_ADDR, AK8963_ASAX, asa, 3)) {
-              gMagAdjX = ((float)asa[0] - 128.0f) / 256.0f + 1.0f;
-              gMagAdjY = ((float)asa[1] - 128.0f) / 256.0f + 1.0f;
-              gMagAdjZ = ((float)asa[2] - 128.0f) / 256.0f + 1.0f;
-            }
-          }
-        }
-
-        if (i2cWriteReg(AK8963_ADDR, AK8963_CNTL1, 0x00)) {
-          delay(10);
-          if (i2cWriteReg(AK8963_ADDR, AK8963_CNTL1, 0x16)) {
-            delay(10);
-            gHasMag = true;
-          }
-        }
-      }
-
       gImuAddr = mpuAddr;
       gImuIsMpu = true;
       gMpuDmpActive = false;
@@ -146,32 +121,10 @@ static bool initGyro() {
   if (!i2cWriteReg(IMU_ADDR_LSM6, LSM_CTRL2_G, 0x4C)) return false;
   delay(10);
   gImuAddr = IMU_ADDR_LSM6;
+  gImuWhoAmI = who;
   gImuIsMpu = false;
-  gHasMag = false;
   gFusionSeeded = false;
   gLastFusionUs = 0;
-  return true;
-}
-
-static bool readMagnetometer() {
-  if (!gHasMag) return false;
-
-  uint8_t st1 = 0;
-  if (!i2cReadRegs(AK8963_ADDR, AK8963_ST1, &st1, 1)) return false;
-  if ((st1 & 0x01) == 0) return false;
-
-  uint8_t data[7] = {0};
-  if (!i2cReadRegs(AK8963_ADDR, AK8963_XOUT_L, data, 7)) return false;
-  uint8_t st2 = data[6];
-  if (st2 & 0x08) return false;
-
-  gMagRawX = (int16_t)((data[1] << 8) | data[0]);
-  gMagRawY = (int16_t)((data[3] << 8) | data[2]);
-  gMagRawZ = (int16_t)((data[5] << 8) | data[4]);
-
-  gMagX = gMagRawX * 0.15f * gMagAdjX;
-  gMagY = gMagRawY * 0.15f * gMagAdjY;
-  gMagZ = gMagRawZ * 0.15f * gMagAdjZ;
   return true;
 }
 
@@ -275,11 +228,6 @@ static bool readGyro() {
     if (fabsf(gGyroX) < GYRO_DEADBAND_DPS) gGyroX = 0.0f;
     if (fabsf(gGyroY) < GYRO_DEADBAND_DPS) gGyroY = 0.0f;
     if (fabsf(gGyroZ) < GYRO_DEADBAND_DPS) gGyroZ = 0.0f;
-
-    if (gHasMag && (millis() - gLastMagReadMs >= 10)) {
-      (void)readMagnetometer();
-      gLastMagReadMs = millis();
-    }
 
     uint32_t nowUs = micros();
     float dt = 0.005f;
