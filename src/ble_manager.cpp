@@ -194,6 +194,12 @@ static uint8_t buildSlowFlags(const BleManager::SensorData& data) {
   if (gBleConnected) {
     flags |= 0x20;
   }
+  if (data.modulePulse) {
+    flags |= 0x40;
+  }
+  if (data.pulseValid) {
+    flags |= 0x80;
+  }
   return flags;
 }
 
@@ -247,6 +253,9 @@ void setCommandHandler(CommandHandler handler) {
 
 void init() {
   Serial.println("[BLE] Initializing NimBLE...");
+  Serial.printf("[BLE] Packet sizes: FAST=%u SLOW=%u\n",
+                static_cast<unsigned>(sizeof(BleManager::FastPacket)),
+                static_cast<unsigned>(sizeof(BleManager::SlowPacket)));
 
   NimBLEDevice::init(BLE_DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -326,6 +335,9 @@ void publishSensorData(const SensorData& data) {
   pkt.currentMa = toInt16Scaled(data.currentMA, 1.0f, -32768.0f, 32767.0f);
   pkt.battPct10 = toUint16Scaled(data.battPct, 10.0f, 0.0f, 1000.0f);
   pkt.cpuPct10 = toUint16Scaled(data.cpuLoad, 10.0f, 0.0f, 1000.0f);
+  pkt.bpm10 = toUint16Scaled(data.bpm, 10.0f, 0.0f, 3000.0f);
+  pkt.spo210 = toUint16Scaled(data.spo2, 10.0f, 0.0f, 1000.0f);
+  pkt.stressPct10 = toUint16Scaled(data.stressPct, 10.0f, 0.0f, 1000.0f);
   pkt.flags = buildSlowFlags(data);
 
   portENTER_CRITICAL(&gPacketMux);

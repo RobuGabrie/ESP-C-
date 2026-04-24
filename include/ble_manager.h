@@ -4,6 +4,8 @@
 
 namespace BleManager {
 
+#pragma pack(push, 1)
+
 struct __attribute__((packed)) FastPacket {
   uint32_t uptimeMs;
   int16_t rollCdeg;
@@ -37,9 +39,18 @@ struct __attribute__((packed)) SlowPacket {
   int16_t currentMa;
   uint16_t battPct10;
   uint16_t cpuPct10;
+  uint16_t bpm10;
+  uint16_t spo210;
+  uint16_t stressPct10;
   uint8_t flags;
   uint8_t seq;
 };
+
+#pragma pack(pop)
+
+#ifndef __INTELLISENSE__
+static_assert(sizeof(SlowPacket) == 29, "SlowPacket size mismatch: expected 29 bytes");
+#endif
 
 struct SensorData {
   const char* timestamp;
@@ -68,6 +79,12 @@ struct SensorData {
   float voltage;
   float currentMA;
   float battPct;
+
+  bool modulePulse;
+  bool pulseValid;
+  float bpm;
+  float spo2;
+  float stressPct;
 
   bool moduleCPU;
   float cpuLoad;

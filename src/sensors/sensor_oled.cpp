@@ -351,6 +351,52 @@ static void pageI2CScanner() {
   }
 }
 
+static void pagePulseOx() {
+  drawTitleBar("PULSE OXIMETER");
+  oled.setTextSize(1);
+
+  if (!modulePulse || !hasMax3010x) {
+    drawCentered("MAX3010x NOT FOUND", 28, 1);
+    drawCentered("Check 0x57 wiring", 40, 1);
+    return;
+  }
+
+  const bool hasBpm = isfinite(gBpm);
+  const bool hasSpo2 = isfinite(gSpo2);
+  const bool hasStress = isfinite(gStressPct);
+
+  oled.setCursor(4, 20);
+  oled.print("BPM:");
+  oled.setCursor(56, 20);
+  if (hasBpm) oled.printf("%3.0f", gBpm);
+  else oled.print("---");
+
+  oled.setCursor(4, 33);
+  oled.print("SpO2:");
+  oled.setCursor(56, 33);
+  if (hasSpo2) oled.printf("%2.0f%%", gSpo2);
+  else oled.print("--% ");
+
+  oled.setCursor(4, 46);
+  oled.print("Stress:");
+  oled.setCursor(56, 46);
+  if (hasStress) oled.printf("%3.0f%%", gStressPct);
+  else oled.print("--% ");
+
+  oled.drawRect(94, 18, 28, 34, SSD1306_WHITE);
+  int fillH = 0;
+  if (hasStress) {
+    fillH = (int)constrain((gStressPct / 100.0f) * 30.0f, 0.0f, 30.0f);
+  }
+  if (fillH > 0) {
+    oled.fillRect(96, 50 - fillH, 24, fillH, SSD1306_WHITE);
+  }
+
+  if (!hasBpm || !hasSpo2) {
+    drawCentered("Place finger on sensor", 56, 1);
+  }
+}
+
 static void drawPage() {
   if (!hasOLED) return;
 
@@ -367,6 +413,7 @@ static void drawPage() {
     case 8: pageRawLog(); break;
     case 9: pageI2CScanner(); break;
     case 10: pageRTC(); break;
+    case 11: pagePulseOx(); break;
   }
   oled.display();
 }

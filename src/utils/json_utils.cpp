@@ -74,6 +74,15 @@ static size_t buildJSON(char* buf, size_t bufSize) {
   if (moduleCurrent) doc["batt"] = roundf(gBattPct * 10.0f) / 10.0f;
   else doc["batt"] = nullptr;
 
+  if (modulePulse && hasMax3010x && isfinite(gBpm)) doc["bpm"] = roundf(gBpm * 10.0f) / 10.0f;
+  else doc["bpm"] = nullptr;
+
+  if (modulePulse && hasMax3010x && isfinite(gSpo2)) doc["spo2"] = roundf(gSpo2 * 10.0f) / 10.0f;
+  else doc["spo2"] = nullptr;
+
+  if (modulePulse && hasMax3010x && isfinite(gStressPct)) doc["stress_pct"] = roundf(gStressPct * 10.0f) / 10.0f;
+  else doc["stress_pct"] = nullptr;
+
   doc["batt_min"] = (moduleCurrent && gBatteryPresent && gBattLife > 0) ? (int)gBattLife : -1;
   doc["ble_connected"] = BleManager::isConnected();
   doc["device_name"] = BleManager::deviceName();

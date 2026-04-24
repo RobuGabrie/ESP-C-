@@ -12,7 +12,7 @@
  *   - 10k NTC thermistor divider on GPIO0 (ADC)
  *   - LSM6DS3-compatible gyro      (I2C 0x6A)
  *   - MPU9250/MPU6500 IMU          (I2C 0x68/0x69)
- *   - MAX30102 (Blood Oxygen/HR)   (I2C 0x57)
+ *   - GY-MAX3010x pulse oximeter   (I2C 0x57)
  *   - LG INR18650MH1 battery      (3.6V nom, 3200mAh)
  *   - 2x tactile push buttons
  *
@@ -22,8 +22,8 @@
  *
  * WIRING:
  *   I2C Bus:
- *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3, MAX30102
- *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3, MAX30102
+ *     ESP32 GPIO8 (SDA) --> OLED, INA219, DS1307, LSM6DS3, GY-MAX3010x
+ *     ESP32 GPIO9 (SCL) --> OLED, INA219, DS1307, LSM6DS3, GY-MAX3010x
  *   Thermistor divider:
  *     3.3V -> 10k NTC -> GPIO0 -> 10k resistor -> GND
  *   Buttons (active LOW, internal pull-up):
@@ -55,6 +55,7 @@
 #include <Adafruit_INA219.h>
 #include <RTClib.h>
 #include <ArduinoJson.h>
+#include <MAX30105.h>
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -199,7 +200,7 @@ static const signed char orientationDefault[9] = {0, 1, 0, 0, 0, 1, 1, 0, 0};
 // =============================================================================
 static const uint8_t  SCREEN_W      = 128;
 static const uint8_t  SCREEN_H      = 64;
-static const uint8_t  NUM_PAGES     = 11;
+static const uint8_t  NUM_PAGES     = 12;
 static const uint16_t DEBOUNCE_MS   = 200;
 
 // =============================================================================
@@ -208,6 +209,7 @@ static const uint16_t DEBOUNCE_MS   = 200;
 static Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
 static Adafruit_INA219  ina;
 static RTC_DS1307       rtc;
+static MAX30105         max3010x;
 static Thermistor       thermistor(R_NOMINAL, R_FIXED, B_COEFF, 12, 3.3, 298.15);
 static Preferences      prefs;
 static MPU9250_DMP      mpu;
@@ -222,6 +224,7 @@ static bool hasOLED   = false;
 static bool hasINA219 = false;
 static bool hasRTC    = false;
 static bool hasGyro   = false;
+static bool hasMax3010x = false;
 static uint8_t gRtcAddr = 0;
 
 // Sensor and fusion state
@@ -297,6 +300,9 @@ static float    gTotalMAh   = 0.0f;
 static float    gBattPct    = 100.0f;
 static float    gBattLife   = -1.0f;
 static float    gCpuLoad    = 0.0f;
+static float    gBpm        = NAN;
+static float    gSpo2       = NAN;
+static float    gStressPct  = NAN;
 static char     gTimestamp[20] = "0000-00-00 00:00:00";
 static uint32_t gUptime     = 0;
 static bool     gBatteryPresent = true;
@@ -369,6 +375,7 @@ static bool moduleTemp    = true;
 static bool moduleGyro    = true;
 static bool moduleCPU     = true;
 static bool moduleCurrent = true;
+static bool modulePulse   = true;
 static volatile bool moduleCpuStress = false;
 
 // =============================================================================
@@ -407,6 +414,7 @@ static void initOledDisplay();
 static void initIna219Sensor();
 static void initRtcClock();
 static void initGyroSubsystem();
+static void initMax3010xSensor();
 static void initBleSubsystem();
 static void processGyroFastPath();
 static void publishImuFastIfDue();
@@ -455,6 +463,7 @@ void IRAM_ATTR isrGyroDataReady() {
 #include "sensors/sensor_ntc.cpp"
 #include "sensors/sensor_mpu_driver.cpp"
 #include "sensors/sensor_rtc.cpp"
+#include "sensors/sensor_max3010x.cpp"
 
 // =============================================================================
 // Local helpers
@@ -641,6 +650,20 @@ static void initGyroSubsystem() {
   }
 }
 
+static void initMax3010xSensor() {
+  hasMax3010x = initMax3010x();
+  if (!hasMax3010x) {
+    modulePulse = false;
+  }
+
+  Serial.printf("[MAX3010x] %s", hasMax3010x ? "OK" : "MISSING/INIT FAIL");
+  if (hasMax3010x) {
+    Serial.println(" @0x57");
+  } else {
+    Serial.println();
+  }
+}
+
 static void initBleSubsystem() {
   Serial.println("[BLE] Initializing BLE communication...");
   BleManager::setCommandHandler(handleBleCommand);
@@ -743,6 +766,11 @@ static void runOneHzTasks() {
       gVoltage,
       gCurrentMA,
       gBattPct,
+      modulePulse,
+      isfinite(gBpm) && isfinite(gSpo2) && isfinite(gStressPct),
+      isfinite(gBpm) ? gBpm : 0.0f,
+      isfinite(gSpo2) ? gSpo2 : 0.0f,
+      isfinite(gStressPct) ? gStressPct : 0.0f,
       moduleCPU,
       gCpuLoad
     });
@@ -769,8 +797,11 @@ static void runOneHzTasks() {
 
   drawPage();
 
-  Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%%\n",
-                gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad);
+  Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%% BPM=%.1f SpO2=%.1f%% STR=%.0f%%\n",
+                gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad,
+                isfinite(gBpm) ? gBpm : 0.0f,
+                isfinite(gSpo2) ? gSpo2 : 0.0f,
+                isfinite(gStressPct) ? gStressPct : 0.0f);
 }
 
 static void refreshI2cScanCacheIfDue() {
@@ -820,6 +851,7 @@ void setup() {
   initIna219Sensor();
   initRtcClock();
   initGyroSubsystem();
+  initMax3010xSensor();
 
   initBleSubsystem();
   
@@ -831,6 +863,9 @@ void loop() {
   handleButtons();
 
   processGyroFastPath();
+  if (modulePulse && hasMax3010x) {
+    (void)readMax3010x();
+  }
   publishImuFastIfDue();
   runOneHzTasks();
   refreshI2cScanCacheIfDue();

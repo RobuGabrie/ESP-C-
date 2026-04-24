@@ -6,6 +6,7 @@ static const char* i2cDeviceName(uint8_t addr) {
 	switch (addr) {
 		case 0x3C: return "SSD1306";
 		case 0x40: return "INA219";
+		case 0x57: return "MAX3010x";
 		case 0x50: return "AT24C32";
 		case 0x60: return "RTC";
 		case 0x68: return "DS1307";

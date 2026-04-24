@@ -73,6 +73,10 @@ static void readOtherSensors() {
     }
   }
 
+  if (modulePulse && hasMax3010x) {
+    (void)readMax3010x();
+  }
+
   uint32_t nowMs = millis();
   uint32_t dtMs = nowMs - lastEnergy;
   if (lastEnergy == 0) {
