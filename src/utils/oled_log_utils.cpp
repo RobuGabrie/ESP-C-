@@ -34,7 +34,7 @@ static void updateOledRawLog() {
     for (size_t i = 0; i < GPIO_PUBLISH_PIN_COUNT; i++) {
       gGpioLastState[i] = digitalRead(GPIO_PUBLISH_PINS[i]);
     }
-    appendOledLog("Logger pornit");
+    appendOledLog("Logger started");
     gGpioLogPrimed = true;
     return;
   }

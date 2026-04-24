@@ -55,7 +55,6 @@
 #include <Adafruit_INA219.h>
 #include <RTClib.h>
 #include <ArduinoJson.h>
-#include <MAX30105.h>
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -200,7 +199,7 @@ static const signed char orientationDefault[9] = {0, 1, 0, 0, 0, 1, 1, 0, 0};
 // =============================================================================
 static const uint8_t  SCREEN_W      = 128;
 static const uint8_t  SCREEN_H      = 64;
-static const uint8_t  NUM_PAGES     = 12;
+static const uint8_t  NUM_PAGES     = 7;
 static const uint16_t DEBOUNCE_MS   = 200;
 
 // =============================================================================
@@ -209,7 +208,6 @@ static const uint16_t DEBOUNCE_MS   = 200;
 static Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
 static Adafruit_INA219  ina;
 static RTC_DS1307       rtc;
-static MAX30105         max3010x;
 static Thermistor       thermistor(R_NOMINAL, R_FIXED, B_COEFF, 12, 3.3, 298.15);
 static Preferences      prefs;
 static MPU9250_DMP      mpu;
@@ -823,12 +821,12 @@ static void updateBleConnectionUiState() {
   }
 
   Serial.println("[BLE] Client disconnected");
-  page = 3;
+  page = 6;
   drawPage();
 }
 
 static void refreshRunningTimerPage() {
-  if (hasOLED && page == 10 && gTimerRunning) {
+  if (hasOLED && page == 1 && gTimerRunning) {
     drawPage();
   }
 }

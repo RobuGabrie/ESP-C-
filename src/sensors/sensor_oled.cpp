@@ -4,12 +4,18 @@
 void runOledBlePairingAnimation() {}
 #else
 
+// =============================================================================
+// Shared drawing helpers
+// =============================================================================
+
 static void drawTitleBar(const char* title) {
   oled.fillRect(0, 0, 128, 14, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
   oled.setTextSize(1);
 
-  if (!BleManager::isConnected() && page != 3 && (millis() / 1000) % 2 == 0) {
+  // Flash "LINK LOST" on every page except the timer (page 1) so it
+  // does not cover the large countdown digits.
+  if (!BleManager::isConnected() && page != 1 && (millis() / 1000) % 2 == 0) {
     int wx = (128 - 13 * 6) / 2;
     oled.setCursor(max(2, wx), 3);
     oled.print("! LINK LOST !");
@@ -19,9 +25,15 @@ static void drawTitleBar(const char* title) {
     oled.print(title);
   }
 
-  oled.setCursor(104, 3);
+  oled.setCursor(102, 3);
   oled.printf("%d/%d", page + 1, NUM_PAGES);
+  if (BleManager::isConnected()) {
+    oled.fillCircle(96, 7, 2, SSD1306_BLACK);
+  } else {
+    oled.drawCircle(96, 7, 2, SSD1306_BLACK);
+  }
   oled.setTextColor(SSD1306_WHITE);
+  oled.drawLine(0, 14, 127, 14, SSD1306_WHITE);
 }
 
 static void drawDynamicBattery(int x, int y, int w, int h, float pct) {
@@ -34,31 +46,6 @@ static void drawDynamicBattery(int x, int y, int w, int h, float pct) {
   }
 }
 
-static void drawBluetoothLogo(int x, int y) {
-  oled.drawLine(x + 4, y, x + 4, y + 12, SSD1306_WHITE);
-  oled.drawLine(x + 4, y, x + 8, y + 3, SSD1306_WHITE);
-  oled.drawLine(x + 8, y + 3, x, y + 9, SSD1306_WHITE);
-  oled.drawLine(x + 4, y + 12, x + 8, y + 9, SSD1306_WHITE);
-  oled.drawLine(x + 8, y + 9, x, y + 3, SSD1306_WHITE);
-}
-
-static void drawArtificialHorizon(int cx, int cy, int r, float pitch, float roll) {
-  oled.drawCircle(cx, cy, r, SSD1306_WHITE);
-
-  float rad = roll * 0.0174533f;
-  float s = sin(rad);
-  float c = cos(rad);
-  int pOff = constrain((int)(pitch * 0.5f), -(r - 2), (r - 2));
-
-  int x1 = cx - (r - 2) * c + pOff * s;
-  int y1 = cy - (r - 2) * s - pOff * c;
-  int x2 = cx + (r - 2) * c + pOff * s;
-  int y2 = cy + (r - 2) * s - pOff * c;
-
-  oled.drawLine(x1, y1, x2, y2, SSD1306_WHITE);
-  oled.drawPixel(cx, cy, SSD1306_WHITE);
-}
-
 static void drawCentered(const char* text, int y, int sz) {
   oled.setTextSize(sz);
   int x = (128 - (int)strlen(text) * 6 * sz) / 2;
@@ -66,40 +53,91 @@ static void drawCentered(const char* text, int y, int sz) {
   oled.print(text);
 }
 
-static void pageDashboard() {
-  drawTitleBar("DASHBOARD HUD");
-  oled.drawLine(60, 14, 60, 64, SSD1306_WHITE);
-  oled.drawLine(60, 39, 128, 39, SSD1306_WHITE);
-
-  oled.setTextSize(1);
-  oled.setCursor(4, 18);
-  oled.print("TEMP C");
-
-  oled.setTextSize(2);
-  char tBuf[8];
-  snprintf(tBuf, sizeof(tBuf), "%.1f", gTemp);
-  int tx = (60 - strlen(tBuf) * 12) / 2;
-  oled.setCursor(max(2, tx), 36);
-  oled.print(tBuf);
-
-  drawDynamicBattery(65, 18, 20, 8, gBattPct);
-  oled.setTextSize(1);
-  oled.setCursor(89, 18);
-  oled.printf("%.0f%%", gBattPct);
-
-  oled.setCursor(65, 29);
-  if (gCurrentMA > 10.0f) oled.print("DISCHRG");
-  else if (gCurrentMA < -10.0f) oled.print("CHARGING");
-  else oled.print("STABLE");
-
-  drawBluetoothLogo(65, 46);
-  oled.setCursor(76, 44);
-  oled.print(BleManager::isConnected() ? "SYNCED" : "SEARCH");
-
-  oled.setCursor(76, 54);
-  oled.printf("CPU:%d%%", (int)gCpuLoad);
+static void drawProgressBar(int x, int y, int w, int h, float pct) {
+  float cPct = constrain(pct, 0.0f, 100.0f);
+  oled.drawRect(x, y, w, h, SSD1306_WHITE);
+  const int innerW = w - 4;
+  const int innerH = h - 4;
+  const int fillW  = (int)(innerW * (cPct / 100.0f));
+  if (fillW > 0) {
+    oled.fillRect(x + 2, y + 2, fillW, innerH, SSD1306_WHITE);
+  }
+  oled.drawFastVLine(x + w / 2, y + 1, h - 2, SSD1306_WHITE);
 }
 
+// =============================================================================
+// Page 0 — OVERVIEW
+// Layout (128×64):
+//   y=0-13  : title bar
+//   y=16    : T:XX.XC            BAT:XXX%
+//   y=26    : CPU:XX%            BLE:ON/OFF
+//   y=35    : horizontal divider ─────────────
+//   y=36-53 : [XXX BPM] | vert | SpO2:XX%
+//                                STR: XX%
+//   y=57    : hh:mm:ss                  LIVE
+// =============================================================================
+static void pageDashboard() {
+  drawTitleBar("OVERVIEW");
+
+  oled.setTextSize(1);
+
+  // Row 1 — temperature (left) and battery (right)
+  oled.setCursor(2, 16);
+  oled.printf("T:%.1fC", gTemp);
+  char batBuf[10];
+  snprintf(batBuf, sizeof(batBuf), "BAT:%3.0f%%", gBattPct);
+  oled.setCursor(128 - (int)strlen(batBuf) * 6 - 2, 16);
+  oled.print(batBuf);
+
+  // Row 2 — CPU (left) and BLE state (right)
+  oled.setCursor(2, 26);
+  oled.printf("CPU:%3.0f%%", gCpuLoad);
+  oled.setCursor(80, 26);
+  oled.printf("BLE:%s", BleManager::isConnected() ? "ON" : "OFF");
+
+  // Horizontal divider
+  oled.drawLine(0, 35, 127, 35, SSD1306_WHITE);
+
+  // BPM — large digits left of the vertical divider (x=4..40, y=38..54)
+  oled.setTextSize(2);
+  oled.setCursor(4, 38);
+  if (isfinite(gBpm)) {
+    oled.printf("%3.0f", gBpm);
+  } else {
+    oled.print("---");
+  }
+  oled.setTextSize(1);
+  oled.setCursor(44, 46);
+  oled.print("BPM");
+
+  // Vertical divider between BPM and vitals
+  oled.drawFastVLine(63, 36, 18, SSD1306_WHITE);
+
+  // SpO2 and stress — right of divider
+  oled.setCursor(67, 38);
+  if (isfinite(gSpo2)) {
+    oled.printf("SpO2:%2.0f%%", gSpo2);
+  } else {
+    oled.print("SpO2: --");
+  }
+  oled.setCursor(67, 48);
+  if (isfinite(gStressPct)) {
+    oled.printf("STR: %2.0f%%", gStressPct);
+  } else {
+    oled.print("STR:  --");
+  }
+
+  // Bottom row — time and connection status
+  const char* tm = (strlen(gTimestamp) >= 19) ? (gTimestamp + 11) : "--:--:--";
+  oled.setCursor(2, 57);
+  oled.print(tm);
+  oled.setCursor(92, 57);
+  oled.print(BleManager::isConnected() ? "LIVE" : "SRCH");
+}
+
+// =============================================================================
+// Page 1 — MISSION TIMER  (unchanged)
+// =============================================================================
 static void pageRTC() {
   drawTitleBar("MISSION TIMER");
   uint32_t currentElapsed = gTimerElapsedMs;
@@ -108,25 +146,20 @@ static void pageRTC() {
   }
 
   uint32_t totalSec = currentElapsed / 1000;
-  uint32_t m = totalSec / 60;
-  uint32_t s = totalSec % 60;
+  uint32_t m   = totalSec / 60;
+  uint32_t s   = totalSec % 60;
   uint32_t ms10 = (currentElapsed % 1000) / 100;
 
   char mainTime[6];
   snprintf(mainTime, sizeof(mainTime), "%02lu:%02lu", m, s);
-
   char decTime[3];
   snprintf(decTime, sizeof(decTime), ".%lu", ms10);
 
-  int tx = 7;
-  int ty = 22;
-
   oled.setTextSize(3);
-  oled.setCursor(tx, ty);
+  oled.setCursor(7, 22);
   oled.print(mainTime);
-
   oled.setTextSize(2);
-  oled.setCursor(tx + 90, ty + 7);
+  oled.setCursor(97, 29);
   oled.print(decTime);
 
   if (gTimerRunning) {
@@ -141,28 +174,183 @@ static void pageRTC() {
   oled.drawLine(0, 48, 128, 48, SSD1306_WHITE);
   oled.setTextSize(1);
   oled.setCursor(2, 54);
-  if (gTimerRunning) oled.print("ACTIVE");
+  if (gTimerRunning)       oled.print("ACTIVE");
   else if (currentElapsed == 0) oled.print("READY");
-  else oled.print("PAUSED");
+  else                     oled.print("PAUSED");
 
   char timeStr[9] = "--:--:--";
   if (strlen(gTimestamp) >= 19) {
     memcpy(timeStr, gTimestamp + 11, 8);
     timeStr[8] = '\0';
   }
-
-  int lx = 128 - (8 * 6) - 2;
-  oled.setCursor(lx, 54);
+  oled.setCursor(128 - 8 * 6 - 2, 54);
   oled.print(timeStr);
 }
 
+// =============================================================================
+// Page 2 — TEMPERATURE  (unchanged)
+// =============================================================================
+static void pageTemp() {
+  drawTitleBar("TEMPERATURE");
+
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%.1f", gTemp);
+
+  oled.setTextSize(3);
+  int numW = (int)strlen(buf) * 18;
+  int sx   = max(0, (128 - numW - 18) / 2);
+  oled.setCursor(sx, 22);
+  oled.print(buf);
+
+  oled.setTextSize(2);
+  oled.setCursor(sx + numW + 2, 26);
+  oled.print("\xF7""C");
+
+  float pct = constrain((gTemp + 20.0f) / 60.0f * 100.0f, 0.0f, 100.0f);
+  drawProgressBar(14, 50, 100, 8, pct);
+  oled.setTextSize(1);
+  oled.setCursor(2, 51);
+  oled.print("-20");
+  oled.setCursor(56, 58);
+  oled.print("10");
+  oled.setCursor(112, 51);
+  oled.print("40");
+}
+
+// =============================================================================
+// Page 3 — PULSE OX
+// Layout:
+//   y=0-13  : title bar
+//   y=15-44 : [BPM box left] [SpO2 box right]  (each h=30)
+//   y=47-55 : STR: [progress bar] XX%
+//             "Place finger" when no signal
+// =============================================================================
+static void pagePulseOx() {
+  drawTitleBar("PULSE OX");
+
+  if (!modulePulse || !hasMax3010x) {
+    drawCentered("MAX3010x NOT FOUND", 28, 1);
+    drawCentered("Check 0x57 wiring", 40, 1);
+    return;
+  }
+
+  const bool hasBpm  = isfinite(gBpm);
+  const bool hasSpo2 = isfinite(gSpo2);
+  const bool hasStr  = isfinite(gStressPct);
+
+  // BPM box (left: x=0..61, y=15..44)
+  oled.drawRect(0, 15, 62, 30, SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(4, 17);
+  oled.print("BPM");
+  oled.setTextSize(2);
+  oled.setCursor(4, 26);
+  if (hasBpm) {
+    char b[5]; snprintf(b, sizeof(b), "%3.0f", gBpm);
+    oled.print(b);
+  } else {
+    oled.print("---");
+  }
+
+  // SpO2 box (right: x=65..127, y=15..44)
+  oled.drawRect(65, 15, 63, 30, SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(69, 17);
+  oled.print("SpO2");
+  oled.setTextSize(2);
+  oled.setCursor(69, 26);
+  if (hasSpo2) {
+    char s[5]; snprintf(s, sizeof(s), "%2.0f", gSpo2);
+    oled.print(s);
+    oled.setTextSize(1);
+    oled.setCursor(105, 31);
+    oled.print("%");
+  } else {
+    oled.print("--");
+    oled.setTextSize(1);
+    oled.setCursor(105, 31);
+    oled.print("%");
+  }
+
+  // Stress row — "STR" label, bar, and percentage (y=47..55)
+  // When no finger: single centred prompt instead.
+  oled.setTextSize(1);
+  if (!hasBpm) {
+    drawCentered("Place finger", 50, 1);
+  } else {
+    oled.setCursor(2, 48);
+    oled.print("STR");
+    drawProgressBar(22, 47, 84, 9, hasStr ? gStressPct : 0.0f);
+    oled.setCursor(109, 48);
+    if (hasStr) {
+      char sv[5]; snprintf(sv, sizeof(sv), "%2.0f%%", gStressPct);
+      oled.print(sv);
+    } else {
+      oled.print("--");
+    }
+  }
+}
+
+// =============================================================================
+// Page 4 — BATTERY %
+// =============================================================================
+static void pageBatteryPct() {
+  drawTitleBar("BATTERY");
+
+  // Battery icon centred horizontally (w=60, h=22, y=15..37)
+  drawDynamicBattery(34, 15, 60, 22, gBattPct);
+
+  // Large percentage below the icon (y=40..56)
+  char pctBuf[7];
+  snprintf(pctBuf, sizeof(pctBuf), "%.0f%%", gBattPct);
+  drawCentered(pctBuf, 40, 2);
+
+  // Voltage and current on the bottom line
+  char line[22];
+  snprintf(line, sizeof(line), "%.2fV  %.0fmA", gVoltage, gCurrentMA);
+  drawCentered(line, 57, 1);
+}
+
+// =============================================================================
+// Page 5 — POWER (voltage, current, wattage)
+// =============================================================================
+static void pagePower() {
+  drawTitleBar("POWER");
+
+  // Voltage (left) and current (right) on the top row
+  oled.setTextSize(1);
+  oled.setCursor(2, 16);
+  oled.printf("V:%.2fV", gVoltage);
+  char iBuf[12];
+  snprintf(iBuf, sizeof(iBuf), "I:%.0fmA", gCurrentMA);
+  oled.setCursor(128 - (int)strlen(iBuf) * 6 - 2, 16);
+  oled.print(iBuf);
+
+  oled.drawLine(0, 26, 127, 26, SSD1306_WHITE);
+
+  // Power draw — large centred value
+  drawCentered("POWER", 29, 1);
+  char pBuf[14];
+  snprintf(pBuf, sizeof(pBuf), "%.0f mW", gPowerMW);
+  drawCentered(pBuf, 37, 2);
+
+  // Charge state
+  const char* state = (gCurrentMA > 10.0f) ? "DISCHARGING"
+                    : (gCurrentMA < -10.0f) ? "CHARGING"
+                    : "STABLE";
+  drawCentered(state, 56, 1);
+}
+
+// =============================================================================
+// Page 6 — SYSTEM STATUS  (unchanged)
+// =============================================================================
 static void pageCPU() {
-  drawTitleBar("SYSTEM CORE");
+  drawTitleBar("SYSTEM STATUS");
   char buf[10];
   snprintf(buf, sizeof(buf), "%d%%", (int)roundf(gCpuLoad));
 
   oled.setTextSize(3);
-  int offset = (128 - strlen(buf) * 18) / 2;
+  int offset = (128 - (int)strlen(buf) * 18) / 2;
   oled.setCursor(max(0, offset), 18);
   oled.print(buf);
 
@@ -173,251 +361,33 @@ static void pageCPU() {
   oled.setTextSize(1);
   oled.setCursor(0, 54);
   oled.printf("Up: %lus", (unsigned long)gUptime);
-  oled.setCursor(72, 54);
-  oled.printf("Str: %s", moduleCpuStress ? "ON" : "OFF");
+  oled.setCursor(68, 54);
+  oled.printf("BLE: %s", BleManager::isConnected() ? "ON" : "OFF");
 }
 
-static void pageRawLog() {
-  drawTitleBar("TELEMETRY");
-  oled.setTextSize(1);
-  oled.setCursor(8, 20);
-  oled.printf("Therm ADC : %4u", gThermRaw);
-  oled.setCursor(8, 32);
-  oled.printf("Gyro X Raw: %6d", gGyroRawX);
-  oled.setCursor(8, 44);
-  oled.printf("Gyro Y Raw: %6d", gGyroRawY);
-  oled.setCursor(8, 56);
-  oled.printf("Gyro Z Raw: %6d", gGyroRawZ);
-}
-
-static void pageTemp() {
-  drawTitleBar("TEMPERATURE");
-
-  float visualHeat = constrain((gTemp + 20.0f) / 60.0f * 100.0f, 0, 100);
-  int tx = 10;
-  int ty = 20;
-  oled.drawRoundRect(tx, ty, 10, 32, 4, SSD1306_WHITE);
-  oled.fillCircle(tx + 4, ty + 34, 7, SSD1306_WHITE);
-  int fillH = (int)(visualHeat / 100.0f * 26.0f);
-  if (fillH > 0) {
-    oled.fillRect(tx + 2, ty + 30 - fillH, 6, fillH, SSD1306_WHITE);
-  }
-
-  int wholeC = (int)gTemp;
-  int decC = (int)(abs(gTemp) * 10) % 10;
-
-  oled.setTextSize(3);
-  char wBuf[6];
-  snprintf(wBuf, sizeof(wBuf), "%d", wholeC);
-  int wLen = strlen(wBuf) * 18;
-  oled.setCursor(38, 28);
-  oled.print(wBuf);
-
-  oled.setTextSize(2);
-  oled.setCursor(38 + wLen, 35);
-  oled.printf(".%d", decC);
-
-  oled.drawCircle(38 + wLen + 26, 28, 3, SSD1306_WHITE);
-  oled.setCursor(38 + wLen + 32, 28);
-  oled.print("C");
-}
-
-static void pageGyro() {
-  drawTitleBar("ATTITUDE HUD");
-  drawArtificialHorizon(64, 42, 20, gPitch, gRoll);
-
-  char yBuf[16];
-  snprintf(yBuf, sizeof(yBuf), "HDG: %03.0f", gYaw);
-  drawCentered(yBuf, 16, 1);
-
-  oled.drawRect(0, 22, 5, 40, SSD1306_WHITE);
-  int pY = 42 - (int)(constrain(gPitch, -90.0f, 90.0f) / 90.0f * 18.0f);
-  oled.fillRect(0, pY - 2, 8, 5, SSD1306_WHITE);
-
-  oled.setTextSize(1);
-  oled.setCursor(10, 32);
-  oled.print("P");
-  oled.setCursor(10, 42);
-  oled.printf("%.0f", gPitch);
-
-  oled.drawRect(123, 22, 5, 40, SSD1306_WHITE);
-  int rY = 42 - (int)(constrain(gRoll, -180.0f, 180.0f) / 180.0f * 18.0f);
-  oled.fillRect(120, rY - 2, 8, 5, SSD1306_WHITE);
-
-  int rightX = 94;
-  if (gRoll <= -100 || gRoll >= 100) rightX = 88;
-  oled.setCursor(114, 32);
-  oled.print("R");
-  oled.setCursor(rightX, 42);
-  oled.printf("%.0f", gRoll);
-}
-
-static void pageWiFi() {
-  drawTitleBar("BLUETOOTH LINK");
-  oled.setTextSize(1);
-
-  if (BleManager::isConnected()) {
-    int bx = 58;
-    int by = 22;
-    oled.drawLine(bx + 6, by, bx + 6, by + 18, SSD1306_WHITE);
-    oled.drawLine(bx + 6, by, bx + 12, by + 4, SSD1306_WHITE);
-    oled.drawLine(bx + 12, by + 4, bx, by + 13, SSD1306_WHITE);
-    oled.drawLine(bx + 6, by + 18, bx + 12, by + 13, SSD1306_WHITE);
-    oled.drawLine(bx + 12, by + 13, bx, by + 4, SSD1306_WHITE);
-
-    drawCentered("CONNECTED", 48, 1);
-    drawCentered("Streaming Telemetry", 56, 1);
-  } else {
-    oled.drawLine(44, 20, 84, 40, SSD1306_WHITE);
-    oled.drawLine(44, 21, 84, 41, SSD1306_WHITE);
-    oled.drawLine(84, 20, 44, 40, SSD1306_WHITE);
-    oled.drawLine(84, 21, 44, 41, SSD1306_WHITE);
-
-    drawCentered("DISCONNECTED", 48, 1);
-    drawCentered("Check Phone App", 56, 1);
-  }
-}
-
-static void pageVoltage() {
-  drawTitleBar("POWER (VOLTS)");
-
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.2f", gVoltage);
-  int numW = strlen(buf) * 18;
-  int sx = max(0, (128 - numW - 14) / 2);
-
-  oled.setTextSize(3);
-  oled.setCursor(sx, 22);
-  oled.print(buf);
-  oled.setTextSize(2);
-  oled.setCursor(sx + numW + 4, 28);
-  oled.print("V");
-
-  float pct = constrain((gVoltage - 3.0f) / 1.2f * 100.0f, 0, 100);
-  oled.drawRect(14, 54, 100, 6, SSD1306_WHITE);
-  oled.fillRect(16, 56, (int)(pct / 100.0f * 96), 2, SSD1306_WHITE);
-}
-
-static void pageCurrent() {
-  drawTitleBar("POWER (AMPS)");
-
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%.0f", gCurrentMA);
-  int numW = strlen(buf) * 18;
-  int sx = max(0, (128 - numW - 24) / 2);
-
-  oled.setTextSize(3);
-  oled.setCursor(sx, 22);
-  oled.print(buf);
-  oled.setTextSize(2);
-  oled.setCursor(sx + numW + 4, 28);
-  oled.print("mA");
-
-  oled.setTextSize(1);
-  char pow[24];
-  snprintf(pow, sizeof(pow), "Draw: %.0f mW", gPowerMW);
-  drawCentered(pow, 54, 1);
-}
-
-static void pageBattery() {
-  drawTitleBar("BATTERY CELL");
-  drawDynamicBattery(34, 18, 60, 24, gBattPct);
-
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.0f%%", gBattPct);
-  drawCentered(buf, 48, 2);
-}
-
-static void pageI2CScanner() {
-  drawTitleBar("I2C DIAGNOSTICS");
-  oled.setTextSize(1);
-
-  if (gI2cFoundCount == 0) {
-    drawCentered("BUS DEAD / MISO", 32, 1);
-    return;
-  }
-
-  const uint8_t maxRows = 4;
-  const uint8_t totalPages = (gI2cFoundCount + maxRows - 1) / maxRows;
-  const uint8_t pageIdx = (totalPages > 1) ? (uint8_t)((millis() / 2000UL) % totalPages) : 0;
-  const uint8_t firstIndex = pageIdx * maxRows;
-
-  for (uint8_t i = 0; i < maxRows; i++) {
-    const uint8_t idx = firstIndex + i;
-    if (idx >= gI2cFoundCount) break;
-    const uint8_t addr = gI2cFound[idx];
-    oled.setCursor(12, 18 + i * 11);
-    oled.printf("[-] 0x%02X %s", addr, i2cDeviceName(addr));
-  }
-}
-
-static void pagePulseOx() {
-  drawTitleBar("PULSE OXIMETER");
-  oled.setTextSize(1);
-
-  if (!modulePulse || !hasMax3010x) {
-    drawCentered("MAX3010x NOT FOUND", 28, 1);
-    drawCentered("Check 0x57 wiring", 40, 1);
-    return;
-  }
-
-  const bool hasBpm = isfinite(gBpm);
-  const bool hasSpo2 = isfinite(gSpo2);
-  const bool hasStress = isfinite(gStressPct);
-
-  oled.setCursor(4, 20);
-  oled.print("BPM:");
-  oled.setCursor(56, 20);
-  if (hasBpm) oled.printf("%3.0f", gBpm);
-  else oled.print("---");
-
-  oled.setCursor(4, 33);
-  oled.print("SpO2:");
-  oled.setCursor(56, 33);
-  if (hasSpo2) oled.printf("%2.0f%%", gSpo2);
-  else oled.print("--% ");
-
-  oled.setCursor(4, 46);
-  oled.print("Stress:");
-  oled.setCursor(56, 46);
-  if (hasStress) oled.printf("%3.0f%%", gStressPct);
-  else oled.print("--% ");
-
-  oled.drawRect(94, 18, 28, 34, SSD1306_WHITE);
-  int fillH = 0;
-  if (hasStress) {
-    fillH = (int)constrain((gStressPct / 100.0f) * 30.0f, 0.0f, 30.0f);
-  }
-  if (fillH > 0) {
-    oled.fillRect(96, 50 - fillH, 24, fillH, SSD1306_WHITE);
-  }
-
-  if (!hasBpm || !hasSpo2) {
-    drawCentered("Place finger on sensor", 56, 1);
-  }
-}
-
+// =============================================================================
+// Page dispatcher
+// 0=Overview  1=Timer  2=Temp  3=PulseOx  4=Battery%  5=Power  6=CPU
+// =============================================================================
 static void drawPage() {
   if (!hasOLED) return;
 
   oled.clearDisplay();
   switch (page) {
-    case 0: pageDashboard(); break;
-    case 1: pageTemp(); break;
-    case 2: pageGyro(); break;
-    case 3: pageWiFi(); break;
-    case 4: pageCPU(); break;
-    case 5: pageVoltage(); break;
-    case 6: pageCurrent(); break;
-    case 7: pageBattery(); break;
-    case 8: pageRawLog(); break;
-    case 9: pageI2CScanner(); break;
-    case 10: pageRTC(); break;
-    case 11: pagePulseOx(); break;
+    case 0: pageDashboard();  break;
+    case 1: pageRTC();        break;
+    case 2: pageTemp();       break;
+    case 3: pagePulseOx();    break;
+    case 4: pageBatteryPct(); break;
+    case 5: pagePower();      break;
+    case 6: pageCPU();        break;
   }
   oled.display();
 }
 
+// =============================================================================
+// BLE pairing splash  (unchanged)
+// =============================================================================
 void runOledBlePairingAnimation() {
   if (!hasOLED) return;
 
@@ -449,7 +419,6 @@ void runOledBlePairingAnimation() {
     }
 
     oled.display();
-
     radius++;
     if (radius > 20) radius = 0;
     delay(40);

@@ -191,8 +191,17 @@ static uint8_t buildSlowFlags(const BleManager::SensorData& data) {
   if (data.motionStillCount >= data.zuptStillRequiredSamples) {
     flags |= 0x10;
   }
-  if (gBleConnected) {
-    flags |= 0x20;
+  {
+    // Bit 5: canopy motion — low gyro magnitude + not fully stationary.
+    // Replaces the BLE-connected bit (redundant: receiver always knows it's connected).
+    float gyroMag = sqrtf(data.gyroX * data.gyroX +
+                          data.gyroY * data.gyroY +
+                          data.gyroZ * data.gyroZ);
+    bool canopyMotion = (gyroMag < 20.0f) &&
+                        (data.motionStillCount < data.zuptStillRequiredSamples);
+    if (canopyMotion) {
+      flags |= 0x20;
+    }
   }
   if (data.modulePulse) {
     flags |= 0x40;
