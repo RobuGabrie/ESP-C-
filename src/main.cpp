@@ -765,7 +765,7 @@ static void runOneHzTasks() {
       gCurrentMA,
       gBattPct,
       modulePulse,
-      isfinite(gBpm) && isfinite(gSpo2) && isfinite(gStressPct),
+      isfinite(gBpm),
       isfinite(gBpm) ? gBpm : 0.0f,
       isfinite(gSpo2) ? gSpo2 : 0.0f,
       isfinite(gStressPct) ? gStressPct : 0.0f,
@@ -795,8 +795,8 @@ static void runOneHzTasks() {
 
   drawPage();
 
-  Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f V=%.2f I=%.1f CPU=%.1f%% BPM=%.1f SpO2=%.1f%% STR=%.0f%%\n",
-                gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gVoltage, gCurrentMA, gCpuLoad,
+  Serial.printf("[%s] T=%.1f TH=%u GX=%.1f GY=%.1f GZ=%.1f AX=%.2f AY=%.2f AZ=%.2f V=%.2f I=%.1f CPU=%.1f%% BPM=%.1f SpO2=%.1f%% STR=%.0f%%\n",
+                gTimestamp, gTemp, gThermRaw, gGyroX, gGyroY, gGyroZ, gAccelX, gAccelY, gAccelZ, gVoltage, gCurrentMA, gCpuLoad,
                 isfinite(gBpm) ? gBpm : 0.0f,
                 isfinite(gSpo2) ? gSpo2 : 0.0f,
                 isfinite(gStressPct) ? gStressPct : 0.0f);

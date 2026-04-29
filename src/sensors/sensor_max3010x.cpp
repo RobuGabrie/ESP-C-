@@ -21,15 +21,16 @@ static const uint8_t  MAX3010X_REG_PART_ID        = 0xFF;
 static const uint8_t  MAX3010X_ADDR          = 0x57;
 static const uint32_t MAX3010X_POLL_MS        = 8;
 static const uint32_t MAX3010X_FINGER_IR_MIN  = 3000;
-static const uint8_t  MAX3010X_INTERVAL_BUF   = 8;
-static const uint16_t MAX3010X_IBI_MIN_MS      = 430;  // ~139 bpm max
-static const uint16_t MAX3010X_IBI_MAX_MS      = 2000; // 30 bpm min
+static const uint8_t  MAX3010X_INTERVAL_BUF   = 32;
+static const uint16_t MAX3010X_IBI_MIN_MS      = 430;
+static const uint16_t MAX3010X_IBI_MAX_MS      = 2000;
 
 static uint32_t gMaxLastPollMs     = 0;
 static float    gMaxDcIr           = 0.0f;
 static float    gMaxDcRed          = 0.0f;
 static float    gMaxAcIr           = 0.0f;
 static float    gMaxAcRed          = 0.0f;
+static float    gFilteredAcIr      = 0.0f;
 static uint32_t gMaxLastBeatMs     = 0;
 static uint16_t gBeatIntervalsMs[MAX3010X_INTERVAL_BUF] = {0};
 static uint8_t  gBeatIntervalCount = 0;
@@ -40,12 +41,6 @@ static bool     gPeakDetectorSeeded = false;
 static float    gLastValidStress   = NAN;
 static uint32_t gLastValidStressMs = 0;
 
-// =============================================================================
-// Direct raw-I2C reader with peak-based beat detection.
-// The older library path truncated 18-bit samples through a 16-bit estimator;
-// this version keeps the 18-bit FIFO data intact and uses the same peak
-// detector shape that previously gave usable BPM.
-// =============================================================================
 static bool writeReg(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MAX3010X_ADDR);
   Wire.write(reg);
@@ -56,12 +51,8 @@ static bool writeReg(uint8_t reg, uint8_t value) {
 static bool readReg(uint8_t reg, uint8_t& value) {
   Wire.beginTransmission(MAX3010X_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-  if (Wire.requestFrom((int)MAX3010X_ADDR, 1) != 1) {
-    return false;
-  }
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)MAX3010X_ADDR, 1) != 1) return false;
   value = (uint8_t)Wire.read();
   return true;
 }
@@ -69,16 +60,10 @@ static bool readReg(uint8_t reg, uint8_t& value) {
 static bool readBurst(uint8_t reg, uint8_t* data, size_t len) {
   Wire.beginTransmission(MAX3010X_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
+  if (Wire.endTransmission(false) != 0) return false;
   const int requested = Wire.requestFrom((int)MAX3010X_ADDR, (int)len);
-  if (requested != (int)len) {
-    return false;
-  }
-  for (size_t i = 0; i < len; i++) {
-    data[i] = (uint8_t)Wire.read();
-  }
+  if (requested != (int)len) return false;
+  for (size_t i = 0; i < len; i++) data[i] = (uint8_t)Wire.read();
   return true;
 }
 
@@ -99,67 +84,63 @@ static float clampfLocal(float v, float lo, float hi) {
   return v;
 }
 
+// FIX 1: nowMs is now passed in fresh per-sample (caller uses millis() inside loop)
+// FIX 2: threshold uses gMaxAcIr which now tracks the filtered signal amplitude
 static bool detectBeat(float acIr, uint32_t nowMs) {
   if (!gPeakDetectorSeeded) {
     gPeakDetectorSeeded = true;
-    gPrevAcIr = acIr;
+    gPrevAcIr    = acIr;
     gPrevDerivIr = 0.0f;
     return false;
   }
 
-  const float deriv = acIr - gPrevAcIr;
-  const bool isPeak = (gPrevDerivIr > 0.0f) && (deriv <= 0.0f);
-  const float peakThreshold = clampfLocal(gMaxAcIr * 0.35f, 80.0f, 20000.0f);
-  const bool amplitudeOk = gPrevAcIr > peakThreshold;
-  const bool refractoryOk = (gMaxLastBeatMs == 0) || ((nowMs - gMaxLastBeatMs) >= 300);
+  const float deriv    = acIr - gPrevAcIr;
+  const bool  isPeak   = (gPrevDerivIr > 0.0f) && (deriv <= 0.0f);
+  // gMaxAcIr now tracks filtered amplitude, so this threshold is meaningful
+  const float peakThreshold = clampfLocal(gMaxAcIr * 0.5f, 80.0f, 20000.0f);
+  const bool  amplitudeOk   = gPrevAcIr > peakThreshold;
+  const bool  refractoryOk  = (gMaxLastBeatMs == 0) || ((nowMs - gMaxLastBeatMs) >= 450);
 
   gPrevDerivIr = deriv;
-  gPrevAcIr = acIr;
+  gPrevAcIr    = acIr;
   return isPeak && amplitudeOk && refractoryOk;
 }
 
 static void resetBeatDetection() {
-  gPrevAcIr = 0.0f;
-  gPrevDerivIr = 0.0f;
+  gPrevAcIr          = 0.0f;
+  gPrevDerivIr       = 0.0f;
+  gFilteredAcIr      = 0.0f;
   gPeakDetectorSeeded = false;
 }
 
-// =============================================================================
-
 static float medianIbiMs() {
   if (gBeatIntervalCount == 0) return NAN;
-
   float values[MAX3010X_INTERVAL_BUF] = {};
   for (uint8_t i = 0; i < gBeatIntervalCount; i++) {
     const uint8_t idx = (gBeatIntervalHead + MAX3010X_INTERVAL_BUF - gBeatIntervalCount + i) % MAX3010X_INTERVAL_BUF;
     values[i] = (float)gBeatIntervalsMs[idx];
   }
-
   for (uint8_t i = 0; i < gBeatIntervalCount; i++) {
     for (uint8_t j = i + 1; j < gBeatIntervalCount; j++) {
-      if (values[j] < values[i]) {
-        const float tmp = values[i];
-        values[i] = values[j];
-        values[j] = tmp;
-      }
+      if (values[j] < values[i]) { const float t = values[i]; values[i] = values[j]; values[j] = t; }
     }
   }
-
-  if (gBeatIntervalCount & 1) {
-    return values[gBeatIntervalCount / 2];
-  }
+  if (gBeatIntervalCount & 1) return values[gBeatIntervalCount / 2];
   const uint8_t mid = gBeatIntervalCount / 2;
   return 0.5f * (values[mid - 1] + values[mid]);
 }
 
+// FIX 4: iterate chronologically oldest→newest so consecutive pairs are actually consecutive
 static float computeRmssdMs() {
   if (gBeatIntervalCount < 3) return NAN;
-  float sumSq = 0.0f;
-  uint8_t diffCount = 0;
-  for (uint8_t i = 1; i < gBeatIntervalCount; i++) {
-    const uint8_t idxA = (gBeatIntervalHead + MAX3010X_INTERVAL_BUF - i)     % MAX3010X_INTERVAL_BUF;
-    const uint8_t idxB = (gBeatIntervalHead + MAX3010X_INTERVAL_BUF - i - 1) % MAX3010X_INTERVAL_BUF;
-    const float d = (float)gBeatIntervalsMs[idxA] - (float)gBeatIntervalsMs[idxB];
+  float    sumSq     = 0.0f;
+  uint8_t  diffCount = 0;
+  // oldest stored interval index
+  const uint8_t oldest = (gBeatIntervalHead + MAX3010X_INTERVAL_BUF - gBeatIntervalCount) % MAX3010X_INTERVAL_BUF;
+  for (uint8_t i = 0; i < (uint8_t)(gBeatIntervalCount - 1); i++) {
+    const uint8_t idxA = (oldest + i)     % MAX3010X_INTERVAL_BUF; // earlier IBI
+    const uint8_t idxB = (oldest + i + 1) % MAX3010X_INTERVAL_BUF; // later IBI
+    const float d = (float)gBeatIntervalsMs[idxB] - (float)gBeatIntervalsMs[idxA];
     sumSq += d * d;
     diffCount++;
   }
@@ -178,16 +159,9 @@ static float computeAverageIbiMs() {
 }
 
 static bool intervalLooksLikeOutlier(uint16_t ibiMs) {
-  if (gBeatIntervalCount < 3) {
-    return false;
-  }
-
+  if (gBeatIntervalCount < 3) return false;
   const float med = medianIbiMs();
-  if (!isfinite(med) || med <= 0.0f) {
-    return false;
-  }
-
-  // Reject intervals that jump too far from the current rhythm estimate.
+  if (!isfinite(med) || med <= 0.0f) return false;
   return fabsf((float)ibiMs - med) > (0.35f * med);
 }
 
@@ -214,30 +188,23 @@ static void registerBeatAt(uint32_t beatNowMs) {
 
 bool initMax3010x() {
   if (!modulePulse) return false;
-
   hasMax3010x = i2cProbe(MAX3010X_ADDR);
   if (!hasMax3010x) { gBpm = NAN; gSpo2 = NAN; gStressPct = NAN; return false; }
 
   uint8_t partId = 0;
-  if (!readReg(MAX3010X_REG_PART_ID, partId)) {
-    gBpm = NAN; gSpo2 = NAN; gStressPct = NAN; return false;
-  }
+  if (!readReg(MAX3010X_REG_PART_ID, partId)) { gBpm = NAN; gSpo2 = NAN; gStressPct = NAN; return false; }
 
-  // Soft reset.
-  if (!writeReg(MAX3010X_REG_MODE_CONFIG, 0x40)) {
-    gBpm = NAN; gSpo2 = NAN; gStressPct = NAN; return false;
-  }
+  if (!writeReg(MAX3010X_REG_MODE_CONFIG, 0x40)) { gBpm = NAN; gSpo2 = NAN; gStressPct = NAN; return false; }
   delay(50);
 
-  // Configure for RED + IR pulse oximetry.
   if (!writeReg(MAX3010X_REG_INTR_STATUS_1, 0x00) ||
       !writeReg(MAX3010X_REG_INTR_STATUS_2, 0x00) ||
-      !writeReg(MAX3010X_REG_FIFO_CONFIG, 0x5F) ||
-      !writeReg(MAX3010X_REG_MODE_CONFIG, 0x03) ||
-      !writeReg(MAX3010X_REG_SPO2_CONFIG, 0x27) ||
-      !writeReg(MAX3010X_REG_LED1_PA, 0x08) ||
-      !writeReg(MAX3010X_REG_LED2_PA, 0x40) ||
-      !writeReg(MAX3010X_REG_LED3_PA, 0x00) ||
+      !writeReg(MAX3010X_REG_FIFO_CONFIG, 0x5F)   ||
+      !writeReg(MAX3010X_REG_MODE_CONFIG, 0x03)   ||
+      !writeReg(MAX3010X_REG_SPO2_CONFIG, 0x27)   ||
+      !writeReg(MAX3010X_REG_LED1_PA, 0x24)       ||
+      !writeReg(MAX3010X_REG_LED2_PA, 0x24)       ||
+      !writeReg(MAX3010X_REG_LED3_PA, 0x00)       ||
       !clearFifoPointers()) {
     gBpm = NAN; gSpo2 = NAN; gStressPct = NAN; return false;
   }
@@ -248,6 +215,7 @@ bool initMax3010x() {
   gMaxDcRed          = 0.0f;
   gMaxAcIr           = 0.0f;
   gMaxAcRed          = 0.0f;
+  gFilteredAcIr      = 0.0f;
   gMaxLastBeatMs     = 0;
   gBeatIntervalCount = 0;
   gBeatIntervalHead  = 0;
@@ -264,33 +232,21 @@ bool readMax3010x() {
   if (nowMs - gMaxLastPollMs < MAX3010X_POLL_MS) return true;
   gMaxLastPollMs = nowMs;
 
-  // Rate-limited diagnostic: print every 2 s so we can see what the sensor
-  // is actually reporting without flooding the serial port.
   static uint32_t sDbgMs = 0;
   const bool printDbg = (nowMs - sDbgMs >= 2000);
   if (printDbg) sDbgMs = nowMs;
 
-  uint8_t wrPtr = 0;
-  uint8_t rdPtr = 0;
-  if (!readFifoPointers(wrPtr, rdPtr)) {
-    return false;
-  }
+  uint8_t wrPtr = 0, rdPtr = 0;
+  if (!readFifoPointers(wrPtr, rdPtr)) return false;
 
   uint8_t samplesAvailable = (wrPtr - rdPtr) & 0x1F;
   while (samplesAvailable--) {
     uint8_t raw[6] = {};
-    if (!readBurst(MAX3010X_REG_FIFO_DATA, raw, sizeof(raw))) {
-      break;
-    }
+    if (!readBurst(MAX3010X_REG_FIFO_DATA, raw, sizeof(raw))) break;
 
-    const uint32_t red = (((uint32_t)raw[0] << 16) |
-                          ((uint32_t)raw[1] << 8) |
-                          (uint32_t)raw[2]) & 0x03FFFFu;
-    const uint32_t ir  = (((uint32_t)raw[3] << 16) |
-                         ((uint32_t)raw[4] << 8) |
-                         (uint32_t)raw[5]) & 0x03FFFFu;
+    const uint32_t red = (((uint32_t)raw[0] << 16) | ((uint32_t)raw[1] << 8) | (uint32_t)raw[2]) & 0x03FFFFu;
+    const uint32_t ir  = (((uint32_t)raw[3] << 16) | ((uint32_t)raw[4] << 8) | (uint32_t)raw[5]) & 0x03FFFFu;
 
-    // Seed the floating-point DC on the very first sample (no-finger level).
     if (gMaxDcIr <= 1.0f) {
       gMaxDcIr  = (float)ir;
       gMaxDcRed = (float)red;
@@ -302,20 +258,22 @@ bool readMax3010x() {
 
     const float acIr  = (float)ir  - gMaxDcIr;
     const float acRed = (float)red - gMaxDcRed;
-    gMaxAcIr  += 0.12f * (fabsf(acIr)  - gMaxAcIr);
-    gMaxAcRed += 0.12f * (fabsf(acRed) - gMaxAcRed);
 
-    const uint32_t fingerMin = (uint32_t)fmaxf((float)MAX3010X_FINGER_IR_MIN,
-                          gMaxDcIr * 0.35f);
-    const bool fingerPresent = (gMaxDcIr >= (float)MAX3010X_FINGER_IR_MIN) ||
-                   (ir >= fingerMin);
+    // FIX 3: alpha 0.5 — less lag, still smooths noise
+    gFilteredAcIr += 0.5f * (acIr - gFilteredAcIr);
+
+    // FIX 2: track filtered amplitude so threshold matches what detectBeat() sees
+    gMaxAcIr  += 0.12f * (fabsf(gFilteredAcIr) - gMaxAcIr);
+    gMaxAcRed += 0.12f * (fabsf(acRed)          - gMaxAcRed);
+
+    const uint32_t fingerMin    = (uint32_t)fmaxf((float)MAX3010X_FINGER_IR_MIN, gMaxDcIr * 0.35f);
+    const bool     fingerPresent = (gMaxDcIr >= (float)MAX3010X_FINGER_IR_MIN) || (ir >= fingerMin);
 
     if (printDbg) {
-      Serial.printf("[MAX] ir=%lu red=%lu dc=%.0f fingerMin=%lu finger=%d "
-                    "acIr=%.0f bpm=%.1f spo2=%.1f\n",
+      Serial.printf("[MAX] ir=%lu red=%lu dc=%.0f fingerMin=%lu finger=%d acIr=%.0f bpm=%.1f spo2=%.1f\n",
                     ir, red, gMaxDcIr, fingerMin, (int)fingerPresent,
                     gMaxAcIr,
-                    isfinite(gBpm) ? gBpm : -1.0f,
+                    isfinite(gBpm)  ? gBpm  : -1.0f,
                     isfinite(gSpo2) ? gSpo2 : -1.0f);
     }
 
@@ -329,47 +287,45 @@ bool readMax3010x() {
       continue;
     }
 
-    const bool beatDetected = detectBeat(acIr, nowMs);
+    // FIX 1: call millis() here so the timestamp is fresh for each sample in the drain loop
+    const uint32_t sampleNowMs = millis();
+    const bool beatDetected = detectBeat(gFilteredAcIr, sampleNowMs);
 
     if (beatDetected) {
-      const uint32_t nowBeat = millis();
       Serial.printf("[MAX] BEAT ibi=%lums bpm=%.1f\n",
-                    gMaxLastBeatMs ? (nowBeat - gMaxLastBeatMs) : 0UL,
+                    gMaxLastBeatMs ? (sampleNowMs - gMaxLastBeatMs) : 0UL,
                     isfinite(gBpm) ? gBpm : 0.0f);
-      if (gMaxLastBeatMs == 0 || (nowBeat - gMaxLastBeatMs) >= 280) {
-        registerBeatAt(nowBeat);
-      }
+      // refractory already enforced inside detectBeat(), no duplicate check needed
+      registerBeatAt(sampleNowMs);
     }
 
-    // SpO2 from ratio of AC/DC for red and IR.
     if (gMaxDcIr > 1.0f && gMaxDcRed > 1.0f && gMaxAcIr > 1.0f) {
       const float ratio = (gMaxAcRed / gMaxDcRed) / (gMaxAcIr / gMaxDcIr);
       float spo2 = 110.0f - 25.0f * ratio;
-      spo2 = clampfLocal(spo2, 70.0f, 100.0f);
+      spo2  = clampfLocal(spo2, 70.0f, 100.0f);
       gSpo2 = isfinite(gSpo2) ? 0.94f * gSpo2 + 0.06f * spo2 : spo2;
     }
 
     if (isfinite(gBpm)) {
-      const float hrPart  = clampfLocal((gBpm - 62.0f) * 1.4f, 0.0f, 100.0f);
+      // FIX 5: baseline 75 bpm (typical resting HR), RMSSD range 10–80 ms, equal weight
+      const float hrPart  = clampfLocal((gBpm - 75.0f) * 2.0f, 0.0f, 100.0f);
       const float rmssd   = computeRmssdMs();
       const float hrvPart = isfinite(rmssd)
-        ? clampfLocal(100.0f - ((rmssd - 12.0f) / 58.0f) * 100.0f, 0.0f, 100.0f)
+        ? clampfLocal(100.0f - ((rmssd - 10.0f) / 70.0f) * 100.0f, 0.0f, 100.0f)
         : hrPart;
-      const float stressNow = clampfLocal(0.65f * hrPart + 0.35f * hrvPart, 0.0f, 100.0f);
+      const float stressNow = clampfLocal(0.5f * hrPart + 0.5f * hrvPart, 0.0f, 100.0f);
       gStressPct         = isfinite(gStressPct) ? 0.9f * gStressPct + 0.1f * stressNow : stressNow;
       gLastValidStress   = gStressPct;
       gLastValidStressMs = millis();
     }
   }
 
-  // Timeout: if no beat for 9 s, treat as signal lost.
   const uint32_t nowCheck = millis();
   if (gMaxLastBeatMs != 0 && (nowCheck - gMaxLastBeatMs) > 9000) {
-    gBpm = NAN;
+    gBpm               = NAN;
     gBeatIntervalCount = 0;
     gMaxLastBeatMs     = 0;
   }
-  // Hold last valid stress for 4 s after BPM is lost to avoid a NAN flash.
   if (!isfinite(gBpm)) {
     gStressPct = (gLastValidStressMs != 0 && (nowCheck - gLastValidStressMs) <= 4000)
                ? gLastValidStress : NAN;
